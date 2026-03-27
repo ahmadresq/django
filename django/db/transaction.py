@@ -34,6 +34,12 @@ def get_autocommit(using=None):
     return get_connection(using).get_autocommit()
 
 
+# Async transaction helpers intentionally bridge through the existing sync
+# transaction APIs. Django's transaction state still lives on the
+# thread-sensitive sync connection path, and async ORM operations use that same
+# bridge today. Keeping these helpers on sync_to_async() preserves one
+# transaction owner/connection model instead of splitting state across the
+# async task and the sync worker thread.
 async def aget_autocommit(using=None):
     """Get the autocommit status of the connection from async code."""
     return await sync_to_async(get_autocommit)(using=using)
