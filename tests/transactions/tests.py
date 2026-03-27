@@ -345,56 +345,62 @@ class AsyncAtomicTests(TransactionTestCase):
         self.assertEqual(await Reporter.objects.acount(), 0)
 
     async def _capture_concurrent_async_atomic_connections(self):
-        first_entered_atomic = asyncio.Event()
-        allow_first_to_exit = asyncio.Event()
-        connection_ids = {}
-        thread_ids = {}
+        try:
+            first_entered_atomic = asyncio.Event()
+            allow_first_to_exit = asyncio.Event()
+            connection_ids = {}
+            thread_ids = {}
 
-        async def capture_connection(name):
-            async with transaction.atomic():
-                connection_ids[name] = await sync_to_async(
-                    lambda: id(connections["default"])
-                )()
-                thread_ids[name] = await sync_to_async(
-                    lambda: connections["default"]._thread_ident
-                )()
-                if name == "outer":
-                    first_entered_atomic.set()
-                    await allow_first_to_exit.wait()
+            async def capture_connection(name):
+                async with transaction.atomic():
+                    connection_ids[name] = await sync_to_async(
+                        lambda: id(connections["default"])
+                    )()
+                    thread_ids[name] = await sync_to_async(
+                        lambda: connections["default"]._thread_ident
+                    )()
+                    if name == "outer":
+                        first_entered_atomic.set()
+                        await allow_first_to_exit.wait()
 
-        outer_task = asyncio.create_task(capture_connection("outer"))
-        await first_entered_atomic.wait()
-        await capture_connection("concurrent")
-        allow_first_to_exit.set()
-        await outer_task
+            outer_task = asyncio.create_task(capture_connection("outer"))
+            await first_entered_atomic.wait()
+            await capture_connection("concurrent")
+            allow_first_to_exit.set()
+            await outer_task
 
-        return connection_ids, thread_ids
+            return connection_ids, thread_ids
+        finally:
+            await sync_to_async(connections.close_all)()
 
     @skipIf(connection.vendor == "sqlite", "SQLite serializes concurrent writes.")
     async def _run_concurrent_async_atomic_isolation(self):
-        first_entered_atomic = asyncio.Event()
-        allow_first_to_exit = asyncio.Event()
+        try:
+            first_entered_atomic = asyncio.Event()
+            allow_first_to_exit = asyncio.Event()
 
-        async def outer_transaction():
-            with self.assertRaisesMessage(Exception, "Oops"):
+            async def outer_transaction():
+                with self.assertRaisesMessage(Exception, "Oops"):
+                    async with transaction.atomic():
+                        await Reporter.objects.acreate(first_name="Tintin")
+                        first_entered_atomic.set()
+                        await allow_first_to_exit.wait()
+                        raise Exception("Oops, that's his last name")
+
+            async def concurrent_transaction():
+                await first_entered_atomic.wait()
                 async with transaction.atomic():
-                    await Reporter.objects.acreate(first_name="Tintin")
-                    first_entered_atomic.set()
-                    await allow_first_to_exit.wait()
-                    raise Exception("Oops, that's his last name")
+                    await Reporter.objects.acreate(first_name="Haddock")
 
-        async def concurrent_transaction():
+            outer_task = asyncio.create_task(outer_transaction())
             await first_entered_atomic.wait()
-            async with transaction.atomic():
-                await Reporter.objects.acreate(first_name="Haddock")
+            await concurrent_transaction()
+            allow_first_to_exit.set()
+            await outer_task
 
-        outer_task = asyncio.create_task(outer_transaction())
-        await first_entered_atomic.wait()
-        await concurrent_transaction()
-        allow_first_to_exit.set()
-        await outer_task
-
-        return await Reporter.objects.acount(), (await Reporter.objects.aget()).first_name
+            return await Reporter.objects.acount(), (await Reporter.objects.aget()).first_name
+        finally:
+            await sync_to_async(connections.close_all)()
 
     def test_concurrent_async_atomic_blocks_use_distinct_sync_connections(self):
         connection_ids, thread_ids = asyncio.run(
