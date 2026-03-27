@@ -62,7 +62,7 @@ either all or none of the changes will be committed.
     errors after starting to send the response.
 
 In practice, this feature wraps every view function in the :func:`atomic`
-decorator described below.
+decorator described below, including async views.
 
 Note that only the execution of your view is enclosed in the transactions.
 Middleware runs outside of the transaction, and so does the rendering of
@@ -135,6 +135,16 @@ Django provides a single API to control database transactions.
             with transaction.atomic():
                 # This code executes inside a transaction.
                 do_more_stuff()
+
+    ``atomic`` can also be used from async code as an async context manager
+    and on async callables as a decorator::
+
+        from django.db import transaction
+
+
+        async def viewfunc(request):
+            async with transaction.atomic():
+                await do_more_stuff()
 
     Wrapping ``atomic`` in a try/except block allows for natural handling of
     integrity errors::
@@ -413,6 +423,16 @@ and the :func:`atomic` (or :setting:`ATOMIC_REQUESTS
 <DATABASE-ATOMIC_REQUESTS>`) transaction API. Calling :func:`on_commit` when
 autocommit is disabled and you are not within an atomic block will result in an
 error.
+
+From async code, use :func:`aon_commit` instead of :func:`on_commit`::
+
+    from django.db import transaction
+
+
+    async def create_then_notify():
+        async with transaction.atomic():
+            await save_object()
+            await transaction.aon_commit(send_notification)
 
 .. _two-phase commit: https://en.wikipedia.org/wiki/Two-phase_commit_protocol
 

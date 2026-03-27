@@ -1023,13 +1023,18 @@ the whole expression in order to call it in an asynchronous-friendly way.
 Transactions
 ------------
 
-Transactions are **not** currently supported with asynchronous queries and
-updates. You will find that trying to use one raises
-``SynchronousOnlyOperation``.
+Transactions are supported with asynchronous queries and updates through the
+:mod:`django.db.transaction` API. Use
+:func:`django.db.transaction.atomic` as an async context manager or on async
+callables as a decorator, and use the ``a``-prefixed transaction helpers such
+as :func:`django.db.transaction.aon_commit`,
+:func:`django.db.transaction.asavepoint`, and
+:func:`django.db.transaction.aget_rollback` when you need to interact with
+transaction state from async code.
 
-If you wish to use a transaction, we suggest you write your ORM code inside a
-separate, synchronous function and then call that using ``sync_to_async`` - see
-:doc:`/topics/async` for more.
+Calling the synchronous transaction helpers directly from an async context will
+still raise ``SynchronousOnlyOperation``. See :doc:`/topics/async` for the
+details of Django's thread-sensitive bridge in async mode.
 
 .. _querying-jsonfield:
 

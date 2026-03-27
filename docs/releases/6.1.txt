@@ -193,7 +193,12 @@ Minor features
 Asynchronous views
 ~~~~~~~~~~~~~~~~~~
 
-* ...
+* Transactions now work in async code via :mod:`django.db.transaction`.
+  :func:`django.db.transaction.atomic` can be used as an async context manager
+  and on async callables as a decorator, :setting:`ATOMIC_REQUESTS
+  <DATABASE-ATOMIC_REQUESTS>` now supports async views, and
+  ``a``-prefixed async transaction helpers such as
+  :func:`django.db.transaction.aon_commit` are available.
 
 Cache
 ~~~~~

@@ -144,9 +144,19 @@ Django also supports some asynchronous model methods that use the database::
         book = await Book.objects.acreate(...)
         await book.tags.aset(tags)
 
-Transactions do not yet work in async mode. If you have a piece of code that
-needs transactions behavior, we recommend you write that piece as a single
-synchronous function and call it using :func:`sync_to_async`.
+Transactions are supported in async mode through the
+:mod:`django.db.transaction` API. Use
+:func:`django.db.transaction.atomic` as an async context manager or on async
+callables as a decorator, and use the ``a``-prefixed async helpers such as
+:func:`django.db.transaction.aon_commit`,
+:func:`django.db.transaction.aget_autocommit`, and
+:func:`django.db.transaction.aset_rollback` when you need to interact with
+transaction state directly.
+
+Transaction management in async mode still relies on Django's thread-sensitive
+sync bridge so that transaction state and ORM queries run on the same database
+connection. As a result, you should continue to avoid passing raw database
+handles or other thread-sensitive references across sync/async boundaries.
 
 :ref:`Persistent database connections <persistent-database-connections>`, set
 via the :setting:`CONN_MAX_AGE` setting, should also be disabled in async mode.
