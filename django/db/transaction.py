@@ -240,7 +240,10 @@ class Atomic(ContextDecorator):
     async def __aenter__(self):
         thread_sensitive_context = ThreadSensitiveContext()
         await thread_sensitive_context.__aenter__()
-        self._async_thread_sensitive_contexts.append(thread_sensitive_context)
+        if thread_sensitive_context.token:
+            self._async_thread_sensitive_contexts.append(thread_sensitive_context)
+        else:
+            self._async_thread_sensitive_contexts.append(None)
         return await sync_to_async(self.__enter__)()
 
     def __exit__(self, exc_type, exc_value, traceback):
@@ -336,6 +339,8 @@ class Atomic(ContextDecorator):
 
     async def __aexit__(self, exc_type, exc_value, traceback):
         thread_sensitive_context = self._async_thread_sensitive_contexts.pop()
+        if thread_sensitive_context is None:
+            return await sync_to_async(self.__exit__)(exc_type, exc_value, traceback)
         try:
             return await sync_to_async(self.__exit__)(exc_type, exc_value, traceback)
         finally:
