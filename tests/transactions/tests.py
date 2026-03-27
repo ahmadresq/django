@@ -344,6 +344,40 @@ class AsyncAtomicTests(TransactionTestCase):
 
         self.assertEqual(await Reporter.objects.acount(), 0)
 
+    async def test_async_on_commit_runs_sync_callback(self):
+        callbacks = []
+
+        async with transaction.atomic():
+            await transaction.aon_commit(lambda: callbacks.append("sync"))
+            self.assertEqual(callbacks, [])
+
+        self.assertEqual(callbacks, ["sync"])
+
+    async def test_async_on_commit_runs_async_callback(self):
+        callbacks = []
+
+        async def callback():
+            callbacks.append("async")
+
+        async with transaction.atomic():
+            await transaction.aon_commit(callback)
+            self.assertEqual(callbacks, [])
+
+        self.assertEqual(callbacks, ["async"])
+
+    async def test_async_on_commit_discards_callback_on_rollback(self):
+        callbacks = []
+
+        async def callback():
+            callbacks.append("async")
+
+        with self.assertRaisesMessage(Exception, "Oops"):
+            async with transaction.atomic():
+                await transaction.aon_commit(callback)
+                raise Exception("Oops, that's his last name")
+
+        self.assertEqual(callbacks, [])
+
     async def _capture_concurrent_async_atomic_connections(self):
         try:
             first_entered_atomic = asyncio.Event()

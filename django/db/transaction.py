@@ -2,7 +2,7 @@ from contextlib import ContextDecorator, contextmanager
 from functools import wraps
 from inspect import iscoroutinefunction
 
-from asgiref.sync import ThreadSensitiveContext, sync_to_async
+from asgiref.sync import ThreadSensitiveContext, async_to_sync, sync_to_async
 
 from django.db import (
     DEFAULT_DB_ALIAS,
@@ -136,6 +136,35 @@ def on_commit(func, using=None, robust=False):
     If the current transaction is rolled back, `func` will not be called.
     """
     get_connection(using).on_commit(func, robust)
+
+
+def _iscoroutine_callable(func):
+    return iscoroutinefunction(func) or iscoroutinefunction(getattr(func, "__call__", func))
+
+
+def _coerce_on_commit_callback(func):
+    if not _iscoroutine_callable(func):
+        return func
+
+    sync_func = async_to_sync(func)
+
+    @wraps(func)
+    def inner():
+        return sync_func()
+
+    return inner
+
+
+async def aon_commit(func, using=None, robust=False):
+    """
+    Register `func` to be called when the current transaction is committed
+    from async code.
+    """
+    await sync_to_async(on_commit)(
+        _coerce_on_commit_callback(func),
+        using=using,
+        robust=robust,
+    )
 
 
 #################################
