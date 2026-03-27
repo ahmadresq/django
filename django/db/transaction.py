@@ -1,4 +1,8 @@
 from contextlib import ContextDecorator, contextmanager
+from functools import wraps
+from inspect import iscoroutinefunction
+
+from asgiref.sync import sync_to_async
 
 from django.db import (
     DEFAULT_DB_ALIAS,
@@ -179,6 +183,17 @@ class Atomic(ContextDecorator):
         self.durable = durable
         self._from_testcase = False
 
+    def __call__(self, func):
+        if iscoroutinefunction(func):
+
+            @wraps(func)
+            async def inner(*args, **kwds):
+                async with self._recreate_cm():
+                    return await func(*args, **kwds)
+
+            return inner
+        return super().__call__(func)
+
     def __enter__(self):
         connection = get_connection(self.using)
 
@@ -220,6 +235,9 @@ class Atomic(ContextDecorator):
 
         if connection.in_atomic_block:
             connection.atomic_blocks.append(self)
+
+    async def __aenter__(self):
+        return await sync_to_async(self.__enter__)()
 
     def __exit__(self, exc_type, exc_value, traceback):
         connection = get_connection(self.using)
@@ -311,6 +329,9 @@ class Atomic(ContextDecorator):
                     connection.connection = None
                 else:
                     connection.in_atomic_block = False
+
+    async def __aexit__(self, exc_type, exc_value, traceback):
+        return await sync_to_async(self.__exit__)(exc_type, exc_value, traceback)
 
 
 def atomic(using=None, savepoint=True, durable=False):

@@ -3,6 +3,8 @@ import threading
 import time
 from unittest import skipIf, skipUnless
 
+from asgiref.sync import sync_to_async
+
 from django.db import (
     DatabaseError,
     Error,
@@ -262,7 +264,7 @@ class AsyncAtomicTests(TransactionTestCase):
 
     async def test_async_context_manager_commit(self):
         async with transaction.atomic():
-            self.assertIs(connection.in_atomic_block, True)
+            self.assertIs(await sync_to_async(lambda: connection.in_atomic_block)(), True)
             reporter = await Reporter.objects.acreate(first_name="Tintin")
 
         self.assertEqual(await Reporter.objects.acount(), 1)
@@ -287,10 +289,33 @@ class AsyncAtomicTests(TransactionTestCase):
         self.assertEqual(await Reporter.objects.acount(), 1)
         self.assertEqual(await Reporter.objects.aget(pk=reporter.pk), reporter)
 
+    async def test_async_merged_commit_rollback(self):
+        async with transaction.atomic():
+            await Reporter.objects.acreate(first_name="Tintin")
+            with self.assertRaisesMessage(Exception, "Oops"):
+                async with transaction.atomic(savepoint=False):
+                    await Reporter.objects.acreate(first_name="Haddock")
+                    raise Exception("Oops, that's his last name")
+
+        self.assertEqual(await Reporter.objects.acount(), 0)
+
+    async def test_async_reuse_commit_rollback(self):
+        atomic = transaction.atomic()
+
+        async with atomic:
+            reporter = await Reporter.objects.acreate(first_name="Tintin")
+            with self.assertRaisesMessage(Exception, "Oops"):
+                async with atomic:
+                    await Reporter.objects.acreate(first_name="Haddock")
+                    raise Exception("Oops, that's his last name")
+
+        self.assertEqual(await Reporter.objects.acount(), 1)
+        self.assertEqual(await Reporter.objects.aget(pk=reporter.pk), reporter)
+
     async def test_async_decorator_syntax_rollback(self):
         @transaction.atomic
         async def make_reporter():
-            self.assertIs(connection.in_atomic_block, True)
+            self.assertIs(await sync_to_async(lambda: connection.in_atomic_block)(), True)
             await Reporter.objects.acreate(first_name="Haddock")
             raise Exception("Oops, that's his last name")
 
