@@ -256,6 +256,50 @@ class AtomicInsideTransactionTests(AtomicTests):
         self.atomic.__exit__(*sys.exc_info())
 
 
+@skipUnlessDBFeature("uses_savepoints")
+class AsyncAtomicTests(TransactionTestCase):
+    available_apps = ["transactions"]
+
+    async def test_async_context_manager_commit(self):
+        async with transaction.atomic():
+            self.assertIs(connection.in_atomic_block, True)
+            reporter = await Reporter.objects.acreate(first_name="Tintin")
+
+        self.assertEqual(await Reporter.objects.acount(), 1)
+        self.assertEqual(await Reporter.objects.aget(pk=reporter.pk), reporter)
+
+    async def test_async_context_manager_rollback(self):
+        with self.assertRaisesMessage(Exception, "Oops"):
+            async with transaction.atomic():
+                await Reporter.objects.acreate(first_name="Haddock")
+                raise Exception("Oops, that's his last name")
+
+        self.assertEqual(await Reporter.objects.acount(), 0)
+
+    async def test_async_nested_commit_rollback(self):
+        async with transaction.atomic():
+            reporter = await Reporter.objects.acreate(first_name="Tintin")
+            with self.assertRaisesMessage(Exception, "Oops"):
+                async with transaction.atomic():
+                    await Reporter.objects.acreate(first_name="Haddock")
+                    raise Exception("Oops, that's his last name")
+
+        self.assertEqual(await Reporter.objects.acount(), 1)
+        self.assertEqual(await Reporter.objects.aget(pk=reporter.pk), reporter)
+
+    async def test_async_decorator_syntax_rollback(self):
+        @transaction.atomic
+        async def make_reporter():
+            self.assertIs(connection.in_atomic_block, True)
+            await Reporter.objects.acreate(first_name="Haddock")
+            raise Exception("Oops, that's his last name")
+
+        with self.assertRaisesMessage(Exception, "Oops"):
+            await make_reporter()
+
+        self.assertEqual(await Reporter.objects.acount(), 0)
+
+
 class AtomicWithoutAutocommitTests(AtomicTests):
     """
     All basic tests for atomic should also pass when autocommit is turned off.
