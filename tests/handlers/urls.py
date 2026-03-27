@@ -5,6 +5,8 @@ from . import views
 urlpatterns = [
     path("regular/", views.regular),
     path("async_regular/", views.async_regular),
+    path("async_in_transaction/", views.async_in_transaction),
+    path("async_not_in_transaction/", views.async_not_in_transaction),
     path("no_response_fbv/", views.no_response),
     path("no_response_cbv/", views.NoResponse()),
     path("streaming/", views.streaming),

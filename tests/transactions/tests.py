@@ -4,7 +4,7 @@ import threading
 import time
 from unittest import skipIf, skipUnless
 
-from asgiref.sync import sync_to_async
+from asgiref.sync import ThreadSensitiveContext, sync_to_async
 
 from django.db import (
     DatabaseError,
@@ -377,6 +377,61 @@ class AsyncAtomicTests(TransactionTestCase):
                 raise Exception("Oops, that's his last name")
 
         self.assertEqual(callbacks, [])
+
+    async def test_async_savepoint_rollback(self):
+        async with transaction.atomic():
+            reporter = await Reporter.objects.acreate(first_name="Tintin")
+            sid = await transaction.asavepoint()
+            await Reporter.objects.acreate(first_name="Haddock")
+            await transaction.asavepoint_rollback(sid)
+
+        self.assertEqual(await Reporter.objects.acount(), 1)
+        self.assertEqual(await Reporter.objects.aget(pk=reporter.pk), reporter)
+
+    async def test_async_get_and_set_rollback(self):
+        async with transaction.atomic():
+            await Reporter.objects.acreate(first_name="Tintin")
+            self.assertFalse(await transaction.aget_rollback())
+            await transaction.aset_rollback(True)
+            self.assertTrue(await transaction.aget_rollback())
+
+        self.assertEqual(await Reporter.objects.acount(), 0)
+
+    async def test_async_transaction_methods_prevented_inside_atomic(self):
+        autocommit = await transaction.aget_autocommit()
+        forbidden_atomic_msg = "This is forbidden when an 'atomic' block is active."
+
+        async with transaction.atomic():
+            with self.assertRaisesMessage(
+                transaction.TransactionManagementError, forbidden_atomic_msg
+            ):
+                await transaction.aset_autocommit(not autocommit)
+            with self.assertRaisesMessage(
+                transaction.TransactionManagementError, forbidden_atomic_msg
+            ):
+                await transaction.acommit()
+            with self.assertRaisesMessage(
+                transaction.TransactionManagementError, forbidden_atomic_msg
+            ):
+                await transaction.arollback()
+
+    async def test_async_autocommit_commit_and_rollback(self):
+        async with ThreadSensitiveContext():
+            self.assertTrue(await transaction.aget_autocommit())
+            await transaction.aset_autocommit(False)
+            try:
+                await Reporter.objects.acreate(first_name="Tintin")
+                await transaction.acommit()
+                self.assertEqual(await Reporter.objects.acount(), 1)
+
+                await Reporter.objects.acreate(first_name="Haddock")
+                await transaction.arollback()
+                self.assertEqual(await Reporter.objects.acount(), 1)
+            finally:
+                if not await transaction.aget_autocommit():
+                    await transaction.arollback()
+                    await transaction.aset_autocommit(True)
+                await sync_to_async(connections.close_all)()
 
     async def _capture_concurrent_async_atomic_connections(self):
         try:

@@ -34,9 +34,19 @@ def get_autocommit(using=None):
     return get_connection(using).get_autocommit()
 
 
+async def aget_autocommit(using=None):
+    """Get the autocommit status of the connection from async code."""
+    return await sync_to_async(get_autocommit)(using=using)
+
+
 def set_autocommit(autocommit, using=None):
     """Set the autocommit status of the connection."""
     return get_connection(using).set_autocommit(autocommit)
+
+
+async def aset_autocommit(autocommit, using=None):
+    """Set the autocommit status of the connection from async code."""
+    return await sync_to_async(set_autocommit)(autocommit, using=using)
 
 
 def commit(using=None):
@@ -44,9 +54,19 @@ def commit(using=None):
     get_connection(using).commit()
 
 
+async def acommit(using=None):
+    """Commit a transaction from async code."""
+    await sync_to_async(commit)(using=using)
+
+
 def rollback(using=None):
     """Roll back a transaction."""
     get_connection(using).rollback()
+
+
+async def arollback(using=None):
+    """Roll back a transaction from async code."""
+    await sync_to_async(rollback)(using=using)
 
 
 def savepoint(using=None):
@@ -58,12 +78,26 @@ def savepoint(using=None):
     return get_connection(using).savepoint()
 
 
+async def asavepoint(using=None):
+    """
+    Create a savepoint from async code and return its identifier.
+    """
+    return await sync_to_async(savepoint)(using=using)
+
+
 def savepoint_rollback(sid, using=None):
     """
     Roll back the most recent savepoint (if one exists). Do nothing if
     savepoints are not supported.
     """
     get_connection(using).savepoint_rollback(sid)
+
+
+async def asavepoint_rollback(sid, using=None):
+    """
+    Roll back the most recent savepoint from async code.
+    """
+    await sync_to_async(savepoint_rollback)(sid, using=using)
 
 
 def savepoint_commit(sid, using=None):
@@ -74,6 +108,13 @@ def savepoint_commit(sid, using=None):
     get_connection(using).savepoint_commit(sid)
 
 
+async def asavepoint_commit(sid, using=None):
+    """
+    Commit the most recent savepoint from async code.
+    """
+    await sync_to_async(savepoint_commit)(sid, using=using)
+
+
 def clean_savepoints(using=None):
     """
     Reset the counter used to generate unique savepoint ids in this thread.
@@ -81,9 +122,21 @@ def clean_savepoints(using=None):
     get_connection(using).clean_savepoints()
 
 
+async def aclean_savepoints(using=None):
+    """
+    Reset the savepoint counter from async code.
+    """
+    await sync_to_async(clean_savepoints)(using=using)
+
+
 def get_rollback(using=None):
     """Get the "needs rollback" flag -- for *advanced use* only."""
     return get_connection(using).get_rollback()
+
+
+async def aget_rollback(using=None):
+    """Get the rollback flag from async code."""
+    return await sync_to_async(get_rollback)(using=using)
 
 
 def set_rollback(rollback, using=None):
@@ -99,6 +152,13 @@ def set_rollback(rollback, using=None):
     and data corruption may occur.
     """
     return get_connection(using).set_rollback(rollback)
+
+
+async def aset_rollback(rollback, using=None):
+    """
+    Set or unset the rollback flag from async code.
+    """
+    return await sync_to_async(set_rollback)(rollback, using=using)
 
 
 @contextmanager

@@ -1,6 +1,7 @@
 import asyncio
 from http import HTTPStatus
 
+from asgiref.sync import sync_to_async
 from django.core.exceptions import BadRequest, SuspiciousOperation
 from django.db import connection, transaction
 from django.http import HttpResponse, StreamingHttpResponse
@@ -63,6 +64,15 @@ def httpstatus_enum(request):
 
 async def async_regular(request):
     return HttpResponse(b"regular content")
+
+
+async def async_in_transaction(request):
+    return HttpResponse(str(await sync_to_async(lambda: connection.in_atomic_block)()))
+
+
+@transaction.non_atomic_requests
+async def async_not_in_transaction(request):
+    return HttpResponse(str(await sync_to_async(lambda: connection.in_atomic_block)()))
 
 
 async def async_streaming(request):
