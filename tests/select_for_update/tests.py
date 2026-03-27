@@ -94,6 +94,13 @@ class SelectForUpdateTests(TransactionTestCase):
             list(Person.objects.select_for_update())
         self.assertTrue(self.has_for_update_sql(ctx.captured_queries))
 
+    @skipUnlessDBFeature("has_select_for_update")
+    async def test_async_select_for_update_inside_atomic(self):
+        async with transaction.atomic():
+            person = await Person.objects.select_for_update().aget(pk=self.person.pk)
+
+        self.assertEqual(person, self.person)
+
     @skipUnlessDBFeature("has_select_for_update_nowait")
     def test_for_update_sql_generated_nowait(self):
         """

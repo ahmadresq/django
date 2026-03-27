@@ -2,7 +2,7 @@ from contextlib import ContextDecorator, contextmanager
 from functools import wraps
 from inspect import iscoroutinefunction
 
-from asgiref.sync import sync_to_async
+from asgiref.sync import ThreadSensitiveContext, sync_to_async
 
 from django.db import (
     DEFAULT_DB_ALIAS,
@@ -182,6 +182,7 @@ class Atomic(ContextDecorator):
         self.savepoint = savepoint
         self.durable = durable
         self._from_testcase = False
+        self._async_thread_sensitive_contexts = []
 
     def __call__(self, func):
         if iscoroutinefunction(func):
@@ -237,6 +238,9 @@ class Atomic(ContextDecorator):
             connection.atomic_blocks.append(self)
 
     async def __aenter__(self):
+        thread_sensitive_context = ThreadSensitiveContext()
+        await thread_sensitive_context.__aenter__()
+        self._async_thread_sensitive_contexts.append(thread_sensitive_context)
         return await sync_to_async(self.__enter__)()
 
     def __exit__(self, exc_type, exc_value, traceback):
@@ -331,7 +335,12 @@ class Atomic(ContextDecorator):
                     connection.in_atomic_block = False
 
     async def __aexit__(self, exc_type, exc_value, traceback):
-        return await sync_to_async(self.__exit__)(exc_type, exc_value, traceback)
+        thread_sensitive_context = self._async_thread_sensitive_contexts.pop()
+        try:
+            return await sync_to_async(self.__exit__)(exc_type, exc_value, traceback)
+        finally:
+            await sync_to_async(connections.close_all)()
+            await thread_sensitive_context.__aexit__(exc_type, exc_value, traceback)
 
 
 def atomic(using=None, savepoint=True, durable=False):
