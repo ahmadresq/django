@@ -442,13 +442,16 @@ class QuerySet(AltersData):
             if self._result_cache is None:
                 if (
                     self._async_connection is not None
-                    and self._iterable_class is ModelIterable
+                    and self._supports_native_async_result_shape()
                 ):
-                    if self._prefetch_related_lookups:
+                    if (
+                        self._prefetch_related_lookups
+                        and issubclass(self._iterable_class, ModelIterable)
+                    ):
                         self._result_cache = [item async for item in self.aiterator()]
                         self._prefetch_done = True
                     else:
-                        self._result_cache = await self._async_connection.fetch_model_queryset(
+                        self._result_cache = await self._async_connection.fetch_queryset(
                             self
                         )
                 else:
@@ -602,9 +605,9 @@ class QuerySet(AltersData):
         )
         if (
             self._async_connection is not None
-            and self._iterable_class is ModelIterable
+            and self._supports_native_async_result_shape()
         ):
-            iterable = self._async_connection.aiter_model_queryset(
+            iterable = self._async_connection.aiter_queryset(
                 self,
                 chunked_fetch=use_chunked_fetch,
                 chunk_size=chunk_size,
@@ -734,9 +737,12 @@ class QuerySet(AltersData):
             ):
                 limit = MAX_GET_RESULTS
                 clone.query.set_limits(high=limit)
-            clone._result_cache = await clone._async_connection.fetch_model_queryset(
-                clone
-            )
+            if clone._supports_native_async_result_shape():
+                clone._result_cache = await clone._async_connection.fetch_queryset(
+                    clone
+                )
+            else:
+                return await sync_to_async(self.get)(*args, **kwargs)
             num = len(clone._result_cache)
             if num == 1:
                 return clone._result_cache[0]
@@ -1274,7 +1280,11 @@ class QuerySet(AltersData):
                 self._check_ordering_first_last_queryset_aggregation(method="first")
                 queryset = self.order_by("pk")
             limited = queryset[:1]
-            results = await limited._async_connection.fetch_model_queryset(limited)
+            if isinstance(limited, list):
+                return limited[0] if limited else None
+            if not limited._supports_native_async_result_shape():
+                return await sync_to_async(self.first)()
+            results = await limited._async_connection.fetch_queryset(limited)
             return results[0] if results else None
         return await sync_to_async(self.first)()
 
@@ -1296,7 +1306,11 @@ class QuerySet(AltersData):
                 self._check_ordering_first_last_queryset_aggregation(method="last")
                 queryset = self.order_by("-pk")
             limited = queryset[:1]
-            results = await limited._async_connection.fetch_model_queryset(limited)
+            if isinstance(limited, list):
+                return limited[0] if limited else None
+            if not limited._supports_native_async_result_shape():
+                return await sync_to_async(self.last)()
+            results = await limited._async_connection.fetch_queryset(limited)
             return results[0] if results else None
         return await sync_to_async(self.last)()
 
@@ -2298,6 +2312,18 @@ class QuerySet(AltersData):
         reasons.
         """
         return PreventQuerySetCloning(self)
+
+    def _supports_native_async_result_shape(self):
+        return issubclass(
+            self._iterable_class,
+            (
+                ModelIterable,
+                ValuesIterable,
+                ValuesListIterable,
+                NamedValuesListIterable,
+                FlatValuesListIterable,
+            ),
+        )
 
     def _chain(self):
         """

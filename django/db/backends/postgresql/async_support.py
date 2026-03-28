@@ -535,22 +535,61 @@ class AsyncPostgreSQLConnection:
         compiler = self.get_compiler(queryset.query.exists())
         return bool(await self.execute_compiler(compiler, result_type=SINGLE))
 
-    async def fetch_model_queryset(self, queryset):
+    def _values_queryset_names(self, queryset):
+        query = queryset.query
+        if query.selected:
+            return list(query.selected)
+        return [
+            *query.extra_select,
+            *query.values_select,
+            *query.annotation_select,
+        ]
+
+    def _named_values_queryset_names(self, queryset):
+        if queryset._fields:
+            return queryset._fields
+        return self._values_queryset_names(queryset)
+
+    def _get_queryset_row_materializer(self, queryset, compiler):
         import operator
-        from itertools import chain
         from weakref import ref as weak_ref
 
-        from django.db.models.query import ModelIterable, get_related_populators
-        from django.db.models.sql.constants import MULTI
+        from django.db.models.query import (
+            FlatValuesListIterable,
+            ModelIterable,
+            NamedValuesListIterable,
+            ValuesIterable,
+            ValuesListIterable,
+            create_namedtuple_class,
+            get_related_populators,
+        )
 
-        if queryset._iterable_class is not ModelIterable:
+        iterable_class = queryset._iterable_class
+        if issubclass(iterable_class, FlatValuesListIterable):
+            return lambda row: row[0]
+
+        if issubclass(iterable_class, NamedValuesListIterable):
+            tuple_class = create_namedtuple_class(
+                *self._named_values_queryset_names(queryset)
+            )
+            new = tuple.__new__
+            return lambda row: new(tuple_class, tuple(row))
+
+        if issubclass(iterable_class, ValuesIterable):
+            names = self._values_queryset_names(queryset)
+            indexes = range(len(names))
+            return lambda row: {names[i]: row[i] for i in indexes}
+
+        if issubclass(iterable_class, ValuesListIterable):
+            return lambda row: tuple(row)
+
+        if not issubclass(iterable_class, ModelIterable):
             raise NotImplementedError(
-                "Native async PostgreSQL get() currently supports only model querysets."
+                "Native async PostgreSQL queryset support currently covers "
+                "model, values(), and values_list() querysets."
             )
 
         db = queryset.db
-        compiler = self.get_compiler(queryset.query)
-        results = await self.execute_compiler(compiler, result_type=MULTI)
         select, klass_info, annotation_col_map = (
             compiler.select,
             compiler.klass_info,
@@ -584,17 +623,9 @@ class AsyncPostgreSQLConnection:
             )
             for field, related_objs in queryset._known_related_objects.items()
         ]
-        fields = [s[0] for s in select[0 : compiler.col_count]]
-        rows = chain.from_iterable(results)
-        converters = compiler.get_converters(fields)
-        if converters:
-            rows = compiler.apply_converters(rows, converters)
-        if compiler.has_composite_fields(fields):
-            rows = compiler.composite_fields_to_tuples(rows, fields)
-
-        objs = []
         peers = []
-        for row in rows:
+
+        def materialize(row):
             obj = model_cls.from_db(
                 db,
                 init_list,
@@ -621,72 +652,29 @@ class AsyncPostgreSQLConnection:
                     pass
                 else:
                     setattr(obj, field.name, rel_obj)
-            objs.append(obj)
-        return objs
+            return obj
 
-    async def aiter_model_queryset(
+        return materialize
+
+    async def aiter_queryset(
         self,
         queryset,
         *,
         chunked_fetch=False,
         chunk_size=2000,
     ):
-        import operator
-        from weakref import ref as weak_ref
-
-        from django.db.models.query import ModelIterable, get_related_populators
         from django.db.models.sql.constants import CURSOR
 
-        if queryset._iterable_class is not ModelIterable:
-            raise NotImplementedError(
-                "Native async PostgreSQL iteration currently supports only "
-                "model querysets."
-            )
-
-        db = queryset.db
         compiler = self.get_compiler(queryset.query)
         cursor = await self.execute_compiler(
             compiler,
             result_type=CURSOR,
             chunked_fetch=chunked_fetch,
         )
-        select, klass_info, annotation_col_map = (
-            compiler.select,
-            compiler.klass_info,
-            compiler.annotation_col_map,
-        )
-        model_cls = klass_info["model"]
-        select_fields = klass_info["select_fields"]
-        model_fields_start, model_fields_end = select_fields[0], select_fields[-1] + 1
-        init_list = [
-            f[0].target.attname for f in select[model_fields_start:model_fields_end]
-        ]
-        related_populators = get_related_populators(
-            klass_info,
-            select,
-            db,
-            queryset._fetch_mode,
-        )
-        known_related_objects = [
-            (
-                field,
-                related_objs,
-                attnames := [
-                    (
-                        field.attname
-                        if from_field == "self"
-                        else queryset.model._meta.get_field(from_field).attname
-                    )
-                    for from_field in field.from_fields
-                ],
-                operator.attrgetter(*attnames),
-            )
-            for field, related_objs in queryset._known_related_objects.items()
-        ]
-        fields = [s[0] for s in select[0 : compiler.col_count]]
+        materialize_row = self._get_queryset_row_materializer(queryset, compiler)
+        fields = [s[0] for s in compiler.select[0 : compiler.col_count]]
         converters = compiler.get_converters(fields)
         has_composite_fields = compiler.has_composite_fields(fields)
-        peers = []
         try:
             while True:
                 rows = await cursor.fetchmany(chunk_size)
@@ -699,40 +687,29 @@ class AsyncPostgreSQLConnection:
                 if has_composite_fields:
                     rows = compiler.composite_fields_to_tuples(rows, fields)
                 for row in rows:
-                    obj = model_cls.from_db(
-                        db,
-                        init_list,
-                        row[model_fields_start:model_fields_end],
-                        fetch_mode=queryset._fetch_mode,
-                    )
-                    if queryset._fetch_mode.track_peers:
-                        peers.append(weak_ref(obj))
-                        obj._state.peers = peers
-                    for rel_populator in related_populators:
-                        rel_populator.populate(row, obj)
-                    if annotation_col_map:
-                        for attr_name, col_pos in annotation_col_map.items():
-                            setattr(obj, attr_name, row[col_pos])
-                    for (
-                        field,
-                        rel_objs,
-                        rel_attnames,
-                        rel_getter,
-                    ) in known_related_objects:
-                        if field.is_cached(obj):
-                            continue
-                        if any(attname not in obj.__dict__ for attname in rel_attnames):
-                            continue
-                        rel_obj_id = rel_getter(obj)
-                        try:
-                            rel_obj = rel_objs[rel_obj_id]
-                        except KeyError:
-                            pass
-                        else:
-                            setattr(obj, field.name, rel_obj)
-                    yield obj
+                    yield materialize_row(row)
         finally:
             await cursor.close()
+
+    async def fetch_queryset(self, queryset):
+        return [item async for item in self.aiter_queryset(queryset)]
+
+    async def fetch_model_queryset(self, queryset):
+        return await self.fetch_queryset(queryset)
+
+    async def aiter_model_queryset(
+        self,
+        queryset,
+        *,
+        chunked_fetch=False,
+        chunk_size=2000,
+    ):
+        async for item in self.aiter_queryset(
+            queryset,
+            chunked_fetch=chunked_fetch,
+            chunk_size=chunk_size,
+        ):
+            yield item
 
     def _make_savepoint_id(self):
         try:
