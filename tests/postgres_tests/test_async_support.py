@@ -1,7 +1,7 @@
 import unittest
 
 from django.db import connection
-from django.test import TransactionTestCase
+from django.test import TransactionTestCase, modify_settings
 
 try:
     from django.db.backends.postgresql.psycopg_any import is_psycopg3
@@ -11,7 +11,10 @@ except ImportError:
 
 @unittest.skipUnless(connection.vendor == "postgresql", "PostgreSQL specific tests")
 @unittest.skipUnless(is_psycopg3, "Native async PostgreSQL support requires psycopg 3")
+@modify_settings(INSTALLED_APPS={"append": "django.contrib.postgres"})
 class PostgreSQLAsyncSupportTests(TransactionTestCase):
+    available_apps = ["django.contrib.postgres"]
+
     async def test_new_async_connection_execute_and_fetchone(self):
         async with await connection.new_async_connection() as async_connection:
             async with async_connection.cursor() as cursor:

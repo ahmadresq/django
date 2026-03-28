@@ -389,8 +389,8 @@ class DatabaseWrapper(BaseDatabaseWrapper):
         self.isolation_level = isolation_level
         connection = await self.Database.AsyncConnection.connect(**conn_params)
         if set_isolation_level:
-            connection.isolation_level = isolation_level
-        connection.autocommit = (
+            await connection.set_isolation_level(isolation_level)
+        await connection.set_autocommit(
             self.settings_dict["AUTOCOMMIT"] if autocommit is None else autocommit
         )
         commit = await self._aconfigure_connection(connection)
