@@ -2,6 +2,7 @@ import asyncio
 import unittest
 
 from django.db import DatabaseError, connection, transaction
+from django.db.models import Count, Max
 from django.test import TransactionTestCase, modify_settings
 
 from .models import CharFieldModel
@@ -436,3 +437,55 @@ class PostgreSQLAsyncSupportTests(TransactionTestCase):
         self.assertEqual(flat_rows, ["alpha", "beta"])
         self.assertEqual(named_row.id, first_created.pk)
         self.assertEqual(named_row.field, "beta")
+
+    async def test_native_async_queryset_helpers_use_native_connection(self):
+        async with await connection.new_async_connection() as async_connection:
+            queryset = CharFieldModel.objects.all().using_async_connection(
+                async_connection
+            )
+            first_created = await queryset.acreate(field="beta")
+            second_created = await queryset.acreate(field="alpha")
+
+            with unittest.mock.patch(
+                "django.db.models.query.sync_to_async",
+                side_effect=AssertionError("sync_to_async bridge should not be used"),
+            ):
+                aggregate = await queryset.aaggregate(
+                    total=Count("id"),
+                    max_pk=Max("pk"),
+                )
+                earliest = await queryset.aearliest("field")
+                latest = await queryset.alatest("field")
+                values_earliest = await queryset.values("field").aearliest("field")
+                flat_latest = await queryset.values_list(
+                    "field", flat=True
+                ).alatest("field")
+                contains_first = await queryset.acontains(first_created)
+                contains_on_filtered = await queryset.filter(field="alpha").acontains(
+                    first_created
+                )
+
+        self.assertEqual(aggregate, {"total": 2, "max_pk": second_created.pk})
+        self.assertEqual(earliest.pk, second_created.pk)
+        self.assertEqual(latest.pk, first_created.pk)
+        self.assertEqual(values_earliest, {"field": "alpha"})
+        self.assertEqual(flat_latest, "beta")
+        self.assertIs(contains_first, True)
+        self.assertIs(contains_on_filtered, False)
+
+    async def test_native_async_queryset_aupdate_uses_native_connection(self):
+        async with await connection.new_async_connection() as async_connection:
+            queryset = CharFieldModel.objects.all().using_async_connection(
+                async_connection
+            )
+            created = await queryset.acreate(field="alpha")
+
+            with unittest.mock.patch(
+                "django.db.models.query.sync_to_async",
+                side_effect=AssertionError("sync_to_async bridge should not be used"),
+            ):
+                rows = await queryset.filter(pk=created.pk).aupdate(field="beta")
+                updated = await queryset.aget(pk=created.pk)
+
+        self.assertEqual(rows, 1)
+        self.assertEqual(updated.field, "beta")

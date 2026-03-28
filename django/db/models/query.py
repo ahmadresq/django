@@ -665,6 +665,24 @@ class QuerySet(AltersData):
         return self.query.chain().get_aggregation(self.db, kwargs)
 
     async def aaggregate(self, *args, **kwargs):
+        if self._async_connection is not None:
+            if self.query.distinct_fields:
+                raise NotImplementedError(
+                    "aggregate() + distinct(fields) not implemented."
+                )
+            self._validate_values_are_expressions(
+                (*args, *kwargs.values()), method_name="aggregate"
+            )
+            for arg in args:
+                try:
+                    arg.default_alias
+                except (AttributeError, TypeError):
+                    raise TypeError("Complex aggregates require an alias")
+                kwargs[arg.default_alias] = arg
+            return await self._async_connection.aggregate_query(
+                self.query.chain(),
+                kwargs,
+            )
         return await sync_to_async(self.aggregate)(*args, **kwargs)
 
     def count(self):
@@ -1248,6 +1266,25 @@ class QuerySet(AltersData):
         return self._earliest(*fields)
 
     async def aearliest(self, *fields):
+        if self._async_connection is not None:
+            if self.query.is_sliced:
+                raise TypeError("Cannot change a query once a slice has been taken.")
+            if fields:
+                order_by = fields
+            else:
+                order_by = getattr(self.model._meta, "get_latest_by")
+                if order_by and not isinstance(order_by, (tuple, list)):
+                    order_by = (order_by,)
+            if order_by is None:
+                raise ValueError(
+                    "earliest() and latest() require either fields as positional "
+                    "arguments or 'get_latest_by' in the model's Meta."
+                )
+            obj = self._chain()
+            obj.query.set_limits(high=1)
+            obj.query.clear_ordering(force=True)
+            obj.query.add_ordering(*order_by)
+            return await obj.aget()
         return await sync_to_async(self.earliest)(*fields)
 
     def latest(self, *fields):
@@ -1260,6 +1297,10 @@ class QuerySet(AltersData):
         return self.reverse()._earliest(*fields)
 
     async def alatest(self, *fields):
+        if self._async_connection is not None:
+            if self.query.is_sliced:
+                raise TypeError("Cannot change a query once a slice has been taken.")
+            return await self.reverse().aearliest(*fields)
         return await sync_to_async(self.latest)(*fields)
 
     def first(self):
@@ -1511,6 +1552,44 @@ class QuerySet(AltersData):
     update.alters_data = True
 
     async def aupdate(self, **kwargs):
+        if self._async_connection is not None:
+            self._not_support_combined_queries("update")
+            if self.query.is_sliced:
+                raise TypeError("Cannot update a query once a slice has been taken.")
+            if self.query.distinct_fields:
+                raise TypeError("Cannot call update() after .distinct(*fields).")
+            self._for_write = True
+            query = self.query.chain(sql.UpdateQuery)
+            query.add_update_values(kwargs)
+
+            new_order_by = []
+            for col in query.order_by:
+                alias = col
+                descending = False
+                if isinstance(alias, str) and alias.startswith("-"):
+                    alias = alias.removeprefix("-")
+                    descending = True
+                if annotation := query.annotations.get(alias):
+                    if getattr(annotation, "contains_aggregate", False):
+                        raise exceptions.FieldError(
+                            f"Cannot update when ordering by an aggregate: {annotation}"
+                        )
+                    if descending:
+                        annotation = annotation.desc()
+                    new_order_by.append(annotation)
+                else:
+                    new_order_by.append(col)
+            query.order_by = tuple(new_order_by)
+            query.clear_select_clause()
+            try:
+                rows = await self._async_connection.execute_update_query(query)
+            except Exception as exc:
+                if self._async_connection.in_atomic_block:
+                    self._async_connection.needs_rollback = True
+                    self._async_connection.rollback_exc = exc
+                raise
+            self._result_cache = None
+            return rows
         return await sync_to_async(self.update)(**kwargs)
 
     aupdate.alters_data = True
@@ -1573,6 +1652,24 @@ class QuerySet(AltersData):
         return self.filter(pk=obj.pk).exists()
 
     async def acontains(self, obj):
+        if self._async_connection is not None:
+            self._not_support_combined_queries("contains")
+            if self._fields is not None:
+                raise TypeError(
+                    "Cannot call QuerySet.contains() after .values() or .values_list()."
+                )
+            try:
+                if obj._meta.concrete_model != self.model._meta.concrete_model:
+                    return False
+            except AttributeError:
+                raise TypeError("'obj' must be a model instance.")
+            if not obj._is_pk_set():
+                raise ValueError(
+                    "QuerySet.contains() cannot be used on unsaved objects."
+                )
+            if self._result_cache is not None:
+                return obj in self._result_cache
+            return await self.filter(pk=obj.pk).aexists()
         return await sync_to_async(self.contains)(obj=obj)
 
     def _prefetch_related_objects(self):
