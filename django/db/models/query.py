@@ -1039,6 +1039,90 @@ class QuerySet(AltersData):
         update_fields=None,
         unique_fields=None,
     ):
+        if self._async_connection is not None:
+            if batch_size is not None and batch_size <= 0:
+                raise ValueError("Batch size must be a positive integer.")
+            for parent in self.model._meta.all_parents:
+                if parent._meta.concrete_model is not self.model._meta.concrete_model:
+                    raise ValueError("Can't bulk create a multi-table inherited model")
+            if not objs:
+                return objs
+            if self.model._meta.order_with_respect_to:
+                raise NotImplementedError(
+                    "Native async bulk_create() doesn't support "
+                    "order_with_respect_to models."
+                )
+            opts = self.model._meta
+            if unique_fields:
+                unique_fields = [
+                    self.model._meta.get_field(
+                        opts.pk.name if name == "pk" else name
+                    )
+                    for name in unique_fields
+                ]
+            if update_fields:
+                update_fields = [
+                    self.model._meta.get_field(name) for name in update_fields
+                ]
+            on_conflict = self._check_bulk_create_options(
+                ignore_conflicts,
+                update_conflicts,
+                update_fields,
+                unique_fields,
+            )
+            self._for_write = True
+            fields = [f for f in opts.concrete_fields if not f.generated]
+            objs = list(objs)
+            objs_with_pk, objs_without_pk = self._prepare_for_bulk_create(objs)
+
+            async def insert_batches():
+                if objs_with_pk:
+                    returned_columns = await self._abatched_insert(
+                        objs_with_pk,
+                        fields,
+                        batch_size,
+                        on_conflict=on_conflict,
+                        update_fields=update_fields,
+                        unique_fields=unique_fields,
+                    )
+                    for obj_with_pk, results in zip(objs_with_pk, returned_columns):
+                        for result, field in zip(results, opts.db_returning_fields):
+                            setattr(obj_with_pk, field.attname, result)
+                    for obj_with_pk in objs_with_pk:
+                        obj_with_pk._state.adding = False
+                        obj_with_pk._state.db = self.db
+                if objs_without_pk:
+                    insert_fields = [
+                        f for f in fields if not isinstance(f, AutoField)
+                    ]
+                    returned_columns = await self._abatched_insert(
+                        objs_without_pk,
+                        insert_fields,
+                        batch_size,
+                        on_conflict=on_conflict,
+                        update_fields=update_fields,
+                        unique_fields=unique_fields,
+                    )
+                    connection = connections[self.db]
+                    if (
+                        connection.features.can_return_rows_from_bulk_insert
+                        and on_conflict is None
+                    ):
+                        assert len(returned_columns) == len(objs_without_pk)
+                    for obj_without_pk, results in zip(
+                        objs_without_pk, returned_columns
+                    ):
+                        for result, field in zip(results, opts.db_returning_fields):
+                            setattr(obj_without_pk, field.attname, result)
+                        obj_without_pk._state.adding = False
+                        obj_without_pk._state.db = self.db
+
+            if objs_with_pk and objs_without_pk:
+                async with self._async_connection.atomic(savepoint=False):
+                    await insert_batches()
+            else:
+                await insert_batches()
+            return objs
         return await sync_to_async(self.bulk_create)(
             objs=objs,
             batch_size=batch_size,
@@ -1111,6 +1195,68 @@ class QuerySet(AltersData):
     bulk_update.alters_data = True
 
     async def abulk_update(self, objs, fields, batch_size=None):
+        if self._async_connection is not None:
+            if batch_size is not None and batch_size <= 0:
+                raise ValueError("Batch size must be a positive integer.")
+            if not fields:
+                raise ValueError("Field names must be given to bulk_update().")
+            objs = tuple(objs)
+            if not all(obj._is_pk_set() for obj in objs):
+                raise ValueError(
+                    "All bulk_update() objects must have a primary key set."
+                )
+            opts = self.model._meta
+            fields = [opts.get_field(name) for name in fields]
+            if any(not f.concrete for f in fields):
+                raise ValueError(
+                    "bulk_update() can only be used with concrete fields."
+                )
+            all_pk_fields = set(opts.pk_fields)
+            for parent in opts.all_parents:
+                all_pk_fields.update(parent._meta.pk_fields)
+            if any(f in all_pk_fields for f in fields):
+                raise ValueError(
+                    "bulk_update() cannot be used with primary key fields."
+                )
+            if not objs:
+                return 0
+            for obj in objs:
+                obj._prepare_related_fields_for_save(
+                    operation_name="bulk_update", fields=fields
+                )
+            self._for_write = True
+            connection = connections[self.db]
+            max_batch_size = connection.ops.bulk_batch_size(
+                [opts.pk, opts.pk, *fields], objs
+            )
+            batch_size = min(batch_size, max_batch_size) if batch_size else max_batch_size
+            requires_casting = connection.features.requires_casted_case_in_updates
+            batches = (
+                objs[i : i + batch_size] for i in range(0, len(objs), batch_size)
+            )
+            updates = []
+            for batch_objs in batches:
+                update_kwargs = {}
+                for field in fields:
+                    when_statements = []
+                    for obj in batch_objs:
+                        attr = getattr(obj, field.attname)
+                        if not hasattr(attr, "resolve_expression"):
+                            attr = Value(attr, output_field=field)
+                        when_statements.append(When(pk=obj.pk, then=attr))
+                    case_statement = Case(*when_statements, output_field=field)
+                    if requires_casting:
+                        case_statement = Cast(case_statement, output_field=field)
+                    update_kwargs[field.attname] = case_statement
+                updates.append(([obj.pk for obj in batch_objs], update_kwargs))
+            rows_updated = 0
+            queryset = self.using_async_connection(self._async_connection)
+            async with self._async_connection.atomic(savepoint=False):
+                for pks, update_kwargs in updates:
+                    rows_updated += await queryset.filter(pk__in=pks).aupdate(
+                        **update_kwargs
+                    )
+            return rows_updated
         return await sync_to_async(self.bulk_update)(
             objs=objs,
             fields=fields,
@@ -2395,6 +2541,34 @@ class QuerySet(AltersData):
     _insert.alters_data = True
     _insert.queryset_only = False
 
+    async def _ainsert(
+        self,
+        objs,
+        fields,
+        *,
+        async_connection,
+        returning_fields=None,
+        raw=False,
+        on_conflict=None,
+        update_fields=None,
+        unique_fields=None,
+    ):
+        self._for_write = True
+        query = sql.InsertQuery(
+            self.model,
+            on_conflict=on_conflict,
+            update_fields=update_fields,
+            unique_fields=unique_fields,
+        )
+        query.insert_values(fields, objs, raw=raw)
+        return await async_connection.execute_insert_query(
+            query,
+            returning_fields=returning_fields,
+        )
+
+    _ainsert.alters_data = True
+    _ainsert.queryset_only = False
+
     def _batched_insert(
         self,
         objs,
@@ -2432,6 +2606,58 @@ class QuerySet(AltersData):
                         item,
                         fields=fields,
                         using=self.db,
+                        on_conflict=on_conflict,
+                        update_fields=update_fields,
+                        unique_fields=unique_fields,
+                        returning_fields=returning_fields,
+                    )
+                )
+        return inserted_rows
+
+    async def _abatched_insert(
+        self,
+        objs,
+        fields,
+        batch_size,
+        on_conflict=None,
+        update_fields=None,
+        unique_fields=None,
+    ):
+        connection = connections[self.db]
+        ops = connection.ops
+        max_batch_size = max(ops.bulk_batch_size(fields, objs), 1)
+        batch_size = min(batch_size, max_batch_size) if batch_size else max_batch_size
+        inserted_rows = []
+        returning_fields = (
+            self.model._meta.db_returning_fields
+            if (
+                connection.features.can_return_rows_from_bulk_insert
+                and (on_conflict is None or on_conflict == OnConflict.UPDATE)
+            )
+            else None
+        )
+        batches = [objs[i : i + batch_size] for i in range(0, len(objs), batch_size)]
+        if len(batches) > 1:
+            async with self._async_connection.atomic(savepoint=False):
+                for item in batches:
+                    inserted_rows.extend(
+                        await self._ainsert(
+                            item,
+                            fields=fields,
+                            async_connection=self._async_connection,
+                            on_conflict=on_conflict,
+                            update_fields=update_fields,
+                            unique_fields=unique_fields,
+                            returning_fields=returning_fields,
+                        )
+                    )
+        else:
+            for item in batches:
+                inserted_rows.extend(
+                    await self._ainsert(
+                        item,
+                        fields=fields,
+                        async_connection=self._async_connection,
                         on_conflict=on_conflict,
                         update_fields=update_fields,
                         unique_fields=unique_fields,

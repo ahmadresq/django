@@ -535,3 +535,50 @@ class PostgreSQLAsyncSupportTests(TransactionTestCase):
         self.assertEqual(updated_obj.field, "beta")
         self.assertIs(created, True)
         self.assertEqual(created_obj.field, "gamma")
+
+    async def test_native_async_queryset_abulk_create_uses_native_connection(self):
+        async with await connection.new_async_connection() as async_connection:
+            queryset = CharFieldModel.objects.all().using_async_connection(
+                async_connection
+            )
+            objs = [
+                CharFieldModel(field="alpha"),
+                CharFieldModel(field="beta"),
+            ]
+
+            with unittest.mock.patch(
+                "django.db.models.query.sync_to_async",
+                side_effect=AssertionError("sync_to_async bridge should not be used"),
+            ):
+                created = await queryset.abulk_create(objs)
+                values = [obj.field async for obj in queryset.order_by("field")]
+
+        self.assertEqual(created, objs)
+        self.assertEqual(values, ["alpha", "beta"])
+        self.assertTrue(all(obj.pk is not None for obj in created))
+        self.assertTrue(all(obj._state.adding is False for obj in created))
+        self.assertTrue(all(obj._state.db == "default" for obj in created))
+
+    async def test_native_async_queryset_abulk_update_uses_native_connection(self):
+        async with await connection.new_async_connection() as async_connection:
+            queryset = CharFieldModel.objects.all().using_async_connection(
+                async_connection
+            )
+            objs = await queryset.abulk_create(
+                [
+                    CharFieldModel(field="alpha"),
+                    CharFieldModel(field="beta"),
+                ]
+            )
+            objs[0].field = "gamma"
+            objs[1].field = "delta"
+
+            with unittest.mock.patch(
+                "django.db.models.query.sync_to_async",
+                side_effect=AssertionError("sync_to_async bridge should not be used"),
+            ):
+                rows = await queryset.abulk_update(objs, ["field"])
+                values = [obj.field async for obj in queryset.order_by("field")]
+
+        self.assertEqual(rows, 2)
+        self.assertEqual(values, ["delta", "gamma"])
