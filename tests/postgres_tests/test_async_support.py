@@ -4,6 +4,8 @@ import unittest
 from django.db import DatabaseError, connection, transaction
 from django.test import TransactionTestCase, modify_settings
 
+from .models import CharFieldModel
+
 try:
     from django.db.backends.postgresql.psycopg_any import is_psycopg3
 except ImportError:
@@ -18,7 +20,7 @@ class AsyncAtomicTestError(Exception):
 @unittest.skipUnless(is_psycopg3, "Native async PostgreSQL support requires psycopg 3")
 @modify_settings(INSTALLED_APPS={"append": "django.contrib.postgres"})
 class PostgreSQLAsyncSupportTests(TransactionTestCase):
-    available_apps = ["django.contrib.postgres"]
+    available_apps = ["django.contrib.postgres", "postgres_tests"]
 
     async def _reset_table(self, async_connection, table_name):
         await async_connection.execute(f"DROP TABLE IF EXISTS {table_name}")
@@ -234,3 +236,59 @@ class PostgreSQLAsyncSupportTests(TransactionTestCase):
                             )
 
             await async_connection.execute(f"DROP TABLE {table_name}")
+
+    async def test_native_async_queryset_create_get_count_and_save(self):
+        async with await connection.new_async_connection() as async_connection:
+            queryset = CharFieldModel.objects.all().using_async_connection(
+                async_connection
+            )
+
+            created = await queryset.acreate(field="alpha")
+            count = await queryset.acount()
+            fetched = await queryset.filter(pk=created.pk).aget()
+            fetched.field = "beta"
+            await fetched.asave(
+                async_connection=async_connection,
+                update_fields=["field"],
+            )
+            updated = await queryset.filter(pk=created.pk).aget()
+
+        self.assertEqual(count, 1)
+        self.assertEqual(fetched.pk, created.pk)
+        self.assertEqual(updated.field, "beta")
+
+    async def test_native_async_queryset_create_rolls_back_with_atomic(self):
+        async with await connection.new_async_connection() as async_connection:
+            queryset = CharFieldModel.objects.all().using_async_connection(
+                async_connection
+            )
+
+            with self.assertRaisesMessage(AsyncAtomicTestError, "Oops"):
+                async with async_connection.atomic():
+                    await queryset.acreate(field="alpha")
+                    raise AsyncAtomicTestError("Oops")
+
+            count = await queryset.acount()
+
+        self.assertEqual(count, 0)
+
+    async def test_native_async_queryset_select_for_update_nowait(self):
+        async with await connection.new_async_connection() as first_connection:
+            first_queryset = CharFieldModel.objects.all().using_async_connection(
+                first_connection
+            )
+            created = await first_queryset.acreate(field="alpha")
+
+            async with first_connection.atomic():
+                locked = await first_queryset.select_for_update().aget(pk=created.pk)
+                self.assertEqual(locked.pk, created.pk)
+
+                async with await connection.new_async_connection() as second_connection:
+                    second_queryset = CharFieldModel.objects.all().using_async_connection(
+                        second_connection
+                    )
+                    with self.assertRaises(DatabaseError):
+                        async with second_connection.atomic():
+                            await second_queryset.select_for_update(
+                                nowait=True
+                            ).aget(pk=created.pk)

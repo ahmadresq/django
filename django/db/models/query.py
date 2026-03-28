@@ -328,6 +328,7 @@ class QuerySet(AltersData):
     def __init__(self, model=None, query=None, using=None, hints=None):
         self.model = model
         self._db = using
+        self._async_connection = None
         self._hints = hints or {}
         self._query = query or sql.Query(self.model)
         self._result_cache = None
@@ -654,6 +655,8 @@ class QuerySet(AltersData):
         return self.query.get_count(using=self.db)
 
     async def acount(self):
+        if self._async_connection is not None:
+            return await self._async_connection.count_queryset(self)
         return await sync_to_async(self.count)()
 
     def get(self, *args, **kwargs):
@@ -692,6 +695,40 @@ class QuerySet(AltersData):
         )
 
     async def aget(self, *args, **kwargs):
+        if self._async_connection is not None:
+            if self.query.combinator and (args or kwargs):
+                raise NotSupportedError(
+                    "Calling QuerySet.get(...) with filters after %s() is not "
+                    "supported." % self.query.combinator
+                )
+            clone = self._chain() if self.query.combinator else self.filter(*args, **kwargs)
+            if self.query.can_filter() and not self.query.distinct_fields:
+                clone = clone.order_by()
+            limit = None
+            if (
+                not clone.query.select_for_update
+                or clone._async_connection.features.supports_select_for_update_with_limit
+            ):
+                limit = MAX_GET_RESULTS
+                clone.query.set_limits(high=limit)
+            clone._result_cache = await clone._async_connection.fetch_model_queryset(
+                clone
+            )
+            num = len(clone._result_cache)
+            if num == 1:
+                return clone._result_cache[0]
+            if not num:
+                raise self.model.DoesNotExist(
+                    "%s matching query does not exist."
+                    % self.model._meta.object_name
+                )
+            raise self.model.MultipleObjectsReturned(
+                "get() returned more than one %s -- it returned %s!"
+                % (
+                    self.model._meta.object_name,
+                    num if not limit or num < limit else "more than %s" % (limit - 1),
+                )
+            )
         return await sync_to_async(self.get)(*args, **kwargs)
 
     def create(self, **kwargs):
@@ -717,6 +754,23 @@ class QuerySet(AltersData):
     create.alters_data = True
 
     async def acreate(self, **kwargs):
+        if self._async_connection is not None:
+            reverse_one_to_one_fields = frozenset(kwargs).intersection(
+                self.model._meta._reverse_one_to_one_field_names
+            )
+            if reverse_one_to_one_fields:
+                raise ValueError(
+                    "The following fields do not exist in this model: %s"
+                    % ", ".join(reverse_one_to_one_fields)
+                )
+            obj = self.model(**kwargs)
+            await obj.asave(
+                force_insert=True,
+                using=self.db,
+                async_connection=self._async_connection,
+            )
+            obj._state.fetch_mode = self._fetch_mode
+            return obj
         return await sync_to_async(self.create)(**kwargs)
 
     acreate.alters_data = True
@@ -1966,6 +2020,18 @@ class QuerySet(AltersData):
         clone._db = alias
         return clone
 
+    def using_async_connection(self, async_connection):
+        clone = self._chain()
+        if clone._db is not None and clone._db != async_connection.alias:
+            raise ValueError(
+                "The queryset is bound to database alias %r but the async "
+                "connection uses alias %r."
+                % (clone._db, async_connection.alias)
+            )
+        clone._db = async_connection.alias
+        clone._async_connection = async_connection
+        return clone
+
     def fetch_mode(self, fetch_mode):
         """Set the fetch mode for the QuerySet."""
         clone = self._chain()
@@ -2224,6 +2290,7 @@ class QuerySet(AltersData):
         c._iterable_class = self._iterable_class
         c._fetch_mode = self._fetch_mode
         c._fields = self._fields
+        c._async_connection = self._async_connection
         return c
 
     def _fetch_all(self):

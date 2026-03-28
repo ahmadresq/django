@@ -28,7 +28,14 @@ from django.db import (
     router,
     transaction,
 )
-from django.db.models import NOT_PROVIDED, ExpressionWrapper, IntegerField, Max, Value
+from django.db.models import (
+    NOT_PROVIDED,
+    ExpressionWrapper,
+    IntegerField,
+    Max,
+    Value,
+    sql,
+)
 from django.db.models.constants import LOOKUP_SEP
 from django.db.models.deletion import CASCADE, DO_NOTHING, Collector, DatabaseOnDelete
 from django.db.models.expressions import DatabaseDefault
@@ -909,7 +916,16 @@ class Model(AltersData, metaclass=ModelBase):
         force_update=False,
         using=None,
         update_fields=None,
+        async_connection=None,
     ):
+        if async_connection is not None:
+            return await self._asave_native(
+                force_insert=force_insert,
+                force_update=force_update,
+                using=using,
+                update_fields=update_fields,
+                async_connection=async_connection,
+            )
         return await sync_to_async(self.save)(
             force_insert=force_insert,
             force_update=force_update,
@@ -918,6 +934,232 @@ class Model(AltersData, metaclass=ModelBase):
         )
 
     asave.alters_data = True
+
+    async def _asave_native(
+        self,
+        *,
+        force_insert=False,
+        force_update=False,
+        using=None,
+        update_fields=None,
+        async_connection,
+    ):
+        self._prepare_related_fields_for_save(operation_name="save")
+
+        using = using or router.db_for_write(self.__class__, instance=self)
+        if async_connection.alias != using:
+            raise ValueError(
+                "The native async connection uses database alias %r but this "
+                "save targets %r." % (async_connection.alias, using)
+            )
+        if force_insert and (force_update or update_fields):
+            raise ValueError("Cannot force both insert and updating in model saving.")
+
+        deferred_non_generated_fields = {
+            f.attname
+            for f in self._meta.concrete_fields
+            if f.attname not in self.__dict__ and f.generated is False
+        }
+        if update_fields is not None:
+            if not update_fields:
+                return
+
+            update_fields = frozenset(update_fields)
+            field_names = self._meta._non_pk_concrete_field_names
+            not_updatable_fields = update_fields.difference(field_names)
+
+            if not_updatable_fields:
+                raise ValueError(
+                    "The following fields do not exist in this model, are m2m "
+                    "fields, primary keys, or are non-concrete fields: %s"
+                    % ", ".join(not_updatable_fields)
+                )
+
+        elif (
+            not force_insert
+            and deferred_non_generated_fields
+            and using == self._state.db
+            and self._is_pk_set()
+        ):
+            field_names = set()
+            pk_fields = self._meta.pk_fields
+            for field in self._meta.concrete_fields:
+                if field not in pk_fields and not hasattr(field, "through"):
+                    field_names.add(field.attname)
+            loaded_fields = field_names.difference(deferred_non_generated_fields)
+            if loaded_fields:
+                update_fields = frozenset(loaded_fields)
+
+        cls = origin = self.__class__
+        if cls._meta.proxy:
+            cls = cls._meta.concrete_model
+        meta = cls._meta
+        if meta.parents:
+            raise NotImplementedError(
+                "Native async PostgreSQL save() currently doesn't support "
+                "models with parent tables."
+            )
+        if not meta.auto_created:
+            pre_save.send(
+                sender=origin,
+                instance=self,
+                raw=False,
+                using=using,
+                update_fields=update_fields,
+            )
+
+        force_insert = self._validate_force_insert(force_insert)
+        try:
+            updated = await self._asave_table_native(
+                cls=cls,
+                force_insert=force_insert,
+                force_update=force_update,
+                using=using,
+                update_fields=update_fields,
+                async_connection=async_connection,
+            )
+        except Exception as exc:
+            if async_connection.in_atomic_block:
+                async_connection.needs_rollback = True
+                async_connection.rollback_exc = exc
+            raise
+
+        self._state.db = using
+        self._state.adding = False
+
+        if not meta.auto_created:
+            post_save.send(
+                sender=origin,
+                instance=self,
+                created=(not updated),
+                update_fields=update_fields,
+                raw=False,
+                using=using,
+            )
+
+    async def _asave_table_native(
+        self,
+        cls,
+        force_insert,
+        force_update,
+        using,
+        update_fields,
+        async_connection,
+        raw=False,
+    ):
+        meta = cls._meta
+        pk_fields = meta.pk_fields
+        non_pks_non_generated = [
+            f
+            for f in meta.local_concrete_fields
+            if f not in pk_fields and not f.generated
+        ]
+
+        if update_fields:
+            non_pks_non_generated = [
+                f
+                for f in non_pks_non_generated
+                if f.name in update_fields or f.attname in update_fields
+            ]
+
+        if not self._is_pk_set(meta):
+            pk_val = meta.pk.get_pk_value_on_save(self)
+            setattr(self, meta.pk.attname, pk_val)
+        pk_set = self._is_pk_set(meta)
+        if not pk_set and (force_update or update_fields):
+            raise ValueError("Cannot force an update in save() with no primary key.")
+        updated = False
+        if (
+            not raw
+            and not force_insert
+            and not force_update
+            and self._state.adding
+            and all(f.has_default() or f.has_db_default() for f in meta.pk_fields)
+        ):
+            force_insert = True
+        if pk_set and not force_insert:
+            if meta.select_on_save:
+                raise NotImplementedError(
+                    "Native async PostgreSQL save() currently doesn't support "
+                    "select_on_save models."
+                )
+            base_qs = cls._base_manager.using(using)
+            values = [
+                (
+                    f,
+                    None,
+                    (getattr(self, f.attname) if raw else f.pre_save(self, False)),
+                )
+                for f in non_pks_non_generated
+            ]
+            returning_fields = [
+                f
+                for f in meta.local_concrete_fields
+                if (
+                    f.generated
+                    and f.referenced_fields.intersection(non_pks_non_generated)
+                )
+            ]
+            for field, _model, value in values:
+                if (update_fields is None or field.name in update_fields) and hasattr(
+                    value, "resolve_expression"
+                ):
+                    returning_fields.append(field)
+
+            query = base_qs.filter(pk=self._get_pk_val(meta)).query.chain(sql.UpdateQuery)
+            query.add_update_fields(values)
+            query.annotations = {}
+            results = await async_connection.execute_update_query(
+                query,
+                returning_fields,
+            )
+            if updated := bool(results):
+                self._assign_returned_values(results[0], returning_fields)
+            elif force_update:
+                raise self.NotUpdated("Forced update did not affect any rows.")
+            elif update_fields:
+                raise self.NotUpdated(
+                    "Save with update_fields did not affect any rows."
+                )
+        if not updated:
+            if meta.order_with_respect_to:
+                raise NotImplementedError(
+                    "Native async PostgreSQL save() currently doesn't support "
+                    "order_with_respect_to models."
+                )
+            insert_fields = [
+                f
+                for f in meta.local_concrete_fields
+                if not f.generated and (pk_set or f is not meta.auto_field)
+            ]
+            returning_fields = list(meta.db_returning_fields)
+            can_return_columns_from_insert = (
+                async_connection.features.can_return_columns_from_insert
+            )
+            for field in insert_fields:
+                value = (
+                    getattr(self, field.attname)
+                    if raw
+                    else field.pre_save(self, add=True)
+                )
+                if hasattr(value, "resolve_expression"):
+                    if field not in returning_fields:
+                        returning_fields.append(field)
+                elif (
+                    field.db_returning
+                    and not can_return_columns_from_insert
+                    and not (pk_set and field is meta.auto_field)
+                ):
+                    returning_fields.remove(field)
+            query = sql.InsertQuery(cls)
+            query.insert_values(insert_fields, [self], raw=raw)
+            results = await async_connection.execute_insert_query(
+                query,
+                returning_fields,
+            )
+            if results:
+                self._assign_returned_values(results[0], returning_fields)
+        return updated
 
     @classmethod
     def _validate_force_insert(cls, force_insert):
