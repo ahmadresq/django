@@ -310,6 +310,22 @@ class DatabaseWrapper(BaseDatabaseWrapper):
             )
         return conn_params
 
+    def get_async_connection_params(self):
+        if not is_psycopg3:
+            raise ImproperlyConfigured(
+                "Native async PostgreSQL connections require psycopg >= 3."
+            )
+        if self.settings_dict["OPTIONS"].get("pool"):
+            raise ImproperlyConfigured(
+                "Native async PostgreSQL connections don't support pooling yet."
+            )
+        conn_params = self.get_connection_params().copy()
+        if self.settings_dict["OPTIONS"].get("server_side_binding") is True:
+            conn_params["cursor_factory"] = self.Database.AsyncCursor
+        else:
+            conn_params["cursor_factory"] = self.Database.AsyncClientCursor
+        return conn_params
+
     @async_unsafe
     def get_new_connection(self, conn_params):
         # self.isolation_level must be set:
@@ -350,6 +366,38 @@ class DatabaseWrapper(BaseDatabaseWrapper):
             )
         return connection
 
+    async def get_new_async_connection(self, conn_params, *, autocommit=None):
+        if not is_psycopg3:
+            raise ImproperlyConfigured(
+                "Native async PostgreSQL connections require psycopg >= 3."
+            )
+        options = self.settings_dict["OPTIONS"]
+        set_isolation_level = False
+        try:
+            isolation_level_value = options["isolation_level"]
+        except KeyError:
+            isolation_level = IsolationLevel.READ_COMMITTED
+        else:
+            try:
+                isolation_level = IsolationLevel(isolation_level_value)
+                set_isolation_level = True
+            except ValueError:
+                raise ImproperlyConfigured(
+                    f"Invalid transaction isolation level {isolation_level_value} "
+                    f"specified. Use one of the psycopg.IsolationLevel values."
+                )
+        self.isolation_level = isolation_level
+        connection = await self.Database.AsyncConnection.connect(**conn_params)
+        if set_isolation_level:
+            await connection.set_isolation_level(isolation_level)
+        await connection.set_autocommit(
+            self.settings_dict["AUTOCOMMIT"] if autocommit is None else autocommit
+        )
+        commit = await self._aconfigure_connection(connection)
+        if commit and not connection.autocommit:
+            await connection.commit()
+        return connection
+
     def ensure_timezone(self):
         # Close the pool so new connections pick up the correct timezone.
         self.close_pool()
@@ -385,6 +433,30 @@ class DatabaseWrapper(BaseDatabaseWrapper):
         # can be the case when using temporary or ephemeral credentials.
         commit_role = self._configure_role(connection)
 
+        return commit_role or commit_tz
+
+    async def _aconfigure_timezone(self, connection):
+        conn_timezone_name = connection.info.parameter_status("TimeZone")
+        timezone_name = self.timezone_name
+        if timezone_name and conn_timezone_name != timezone_name:
+            with self.wrap_database_errors:
+                async with connection.cursor() as cursor:
+                    await cursor.execute(self.ops.set_time_zone_sql(), [timezone_name])
+            return True
+        return False
+
+    async def _aconfigure_role(self, connection):
+        if new_role := self.settings_dict["OPTIONS"].get("assume_role"):
+            with self.wrap_database_errors:
+                async with connection.cursor() as cursor:
+                    sql = self.ops.compose_sql("SET ROLE %s", [new_role])
+                    await cursor.execute(sql)
+            return True
+        return False
+
+    async def _aconfigure_connection(self, connection):
+        commit_tz = await self._aconfigure_timezone(connection)
+        commit_role = await self._aconfigure_role(connection)
         return commit_role or commit_tz
 
     def _close(self):
@@ -554,6 +626,14 @@ class DatabaseWrapper(BaseDatabaseWrapper):
 
     def make_debug_cursor(self, cursor):
         return CursorDebugWrapper(cursor, self)
+
+    async def new_async_connection(self, *, autocommit=None):
+        from .async_support import AsyncPostgreSQLConnection
+
+        return await AsyncPostgreSQLConnection.connect(
+            self,
+            autocommit=autocommit,
+        )
 
 
 if is_psycopg3:
