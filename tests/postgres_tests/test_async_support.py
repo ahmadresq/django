@@ -369,3 +369,70 @@ class PostgreSQLAsyncSupportTests(TransactionTestCase):
 
         self.assertEqual(values, ["alpha", "beta", "gamma"])
         self.assertEqual(chunked_cursor.call_count, 1)
+
+    async def test_native_async_values_queryset_uses_native_connection(self):
+        async with await connection.new_async_connection() as async_connection:
+            queryset = CharFieldModel.objects.all().using_async_connection(
+                async_connection
+            )
+            first_created = await queryset.acreate(field="beta")
+            second_created = await queryset.acreate(field="alpha")
+            values_queryset = queryset.values("id", "field").order_by("field")
+
+            with unittest.mock.patch(
+                "django.db.models.query.sync_to_async",
+                side_effect=AssertionError("sync_to_async bridge should not be used"),
+            ):
+                values = [row async for row in values_queryset]
+                cached_values = [row async for row in values_queryset]
+                first_row = await values_queryset.afirst()
+                last_row = await values_queryset.alast()
+                fetched_row = await values_queryset.filter(field="alpha").aget()
+
+        self.assertEqual(
+            values,
+            [
+                {"id": second_created.pk, "field": "alpha"},
+                {"id": first_created.pk, "field": "beta"},
+            ],
+        )
+        self.assertEqual(cached_values, values)
+        self.assertEqual(first_row, values[0])
+        self.assertEqual(last_row, values[1])
+        self.assertEqual(fetched_row, values[0])
+
+    async def test_native_async_values_list_variants_use_native_connection(self):
+        async with await connection.new_async_connection() as async_connection:
+            queryset = CharFieldModel.objects.all().using_async_connection(
+                async_connection
+            )
+            first_created = await queryset.acreate(field="beta")
+            second_created = await queryset.acreate(field="alpha")
+            tuple_queryset = queryset.values_list("id", "field").order_by("field")
+            flat_queryset = queryset.values_list("field", flat=True).order_by("field")
+            named_queryset = queryset.values_list(
+                "id", "field", named=True
+            ).order_by("field")
+
+            with unittest.mock.patch(
+                "django.db.models.query.sync_to_async",
+                side_effect=AssertionError("sync_to_async bridge should not be used"),
+            ):
+                tuple_rows = [row async for row in tuple_queryset]
+                first_tuple = await tuple_queryset.afirst()
+                flat_rows = [
+                    value async for value in flat_queryset.aiterator(chunk_size=1)
+                ]
+                named_row = await named_queryset.filter(field="beta").aget()
+
+        self.assertEqual(
+            tuple_rows,
+            [
+                (second_created.pk, "alpha"),
+                (first_created.pk, "beta"),
+            ],
+        )
+        self.assertEqual(first_tuple, tuple_rows[0])
+        self.assertEqual(flat_rows, ["alpha", "beta"])
+        self.assertEqual(named_row.id, first_created.pk)
+        self.assertEqual(named_row.field, "beta")
