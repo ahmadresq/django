@@ -292,3 +292,33 @@ class PostgreSQLAsyncSupportTests(TransactionTestCase):
                             await second_queryset.select_for_update(
                                 nowait=True
                             ).aget(pk=created.pk)
+
+    async def test_native_async_queryset_aexists(self):
+        async with await connection.new_async_connection() as async_connection:
+            queryset = CharFieldModel.objects.all().using_async_connection(
+                async_connection
+            )
+            self.assertFalse(await queryset.aexists())
+
+            await queryset.acreate(field="alpha")
+
+            self.assertTrue(await queryset.aexists())
+            self.assertFalse(await queryset.filter(field="missing").aexists())
+
+    async def test_native_async_queryset_afirst_and_alast(self):
+        async with await connection.new_async_connection() as async_connection:
+            queryset = CharFieldModel.objects.all().using_async_connection(
+                async_connection
+            )
+
+            self.assertIsNone(await queryset.afirst())
+            self.assertIsNone(await queryset.alast())
+
+            first_created = await queryset.acreate(field="zeta")
+            second_created = await queryset.acreate(field="alpha")
+
+            first_obj = await queryset.afirst()
+            last_obj = await queryset.alast()
+
+        self.assertEqual(first_obj.pk, first_created.pk)
+        self.assertEqual(last_obj.pk, second_created.pk)

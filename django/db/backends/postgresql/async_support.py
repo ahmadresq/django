@@ -362,7 +362,13 @@ class AsyncPostgreSQLConnection:
 
     async def execute_compiler(self, compiler, *, result_type):
         from django.core.exceptions import EmptyResultSet
-        from django.db.models.sql.constants import CURSOR, MULTI, NO_RESULTS, ROW_COUNT
+        from django.db.models.sql.constants import (
+            CURSOR,
+            MULTI,
+            NO_RESULTS,
+            ROW_COUNT,
+            SINGLE,
+        )
 
         result_type = result_type or NO_RESULTS
         try:
@@ -396,7 +402,7 @@ class AsyncPostgreSQLConnection:
             return None
 
         try:
-            if result_type == "single":
+            if result_type == SINGLE:
                 row = await cursor.fetchone()
                 if row:
                     return row[0 : compiler.col_count]
@@ -508,6 +514,12 @@ class AsyncPostgreSQLConnection:
             await cursor.execute(f"SELECT COUNT(*) FROM ({sql}) subquery", params)
             row = await cursor.fetchone()
         return row[0]
+
+    async def has_results_queryset(self, queryset):
+        from django.db.models.sql.constants import SINGLE
+
+        compiler = self.get_compiler(queryset.query.exists())
+        return bool(await self.execute_compiler(compiler, result_type=SINGLE))
 
     async def fetch_model_queryset(self, queryset):
         import operator
