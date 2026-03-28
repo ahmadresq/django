@@ -189,6 +189,7 @@ class AsyncPostgreSQLConnection:
         self.db = db
         self.connection = connection
         self.autocommit = connection.autocommit
+        self._named_cursor_idx = 0
         self.in_atomic_block = False
         self.savepoint_state = 0
         self.savepoint_ids = []
@@ -238,6 +239,19 @@ class AsyncPostgreSQLConnection:
             ),
             self.db,
             transaction_connection=self,
+        )
+
+    def chunked_cursor(self):
+        self._named_cursor_idx += 1
+        try:
+            current_task = asyncio.current_task()
+        except RuntimeError:
+            current_task = None
+        task_ident = str(id(current_task)) if current_task is not None else "sync"
+        return self.cursor(
+            name=f"_django_async_curs_{task_ident}_{self._named_cursor_idx}",
+            scrollable=False,
+            withhold=self.connection.autocommit,
         )
 
     async def execute(self, query, params=None, *, prepare=None, binary=False):
@@ -360,7 +374,7 @@ class AsyncPostgreSQLConnection:
             elide_empty,
         )
 
-    async def execute_compiler(self, compiler, *, result_type):
+    async def execute_compiler(self, compiler, *, result_type, chunked_fetch=False):
         from django.core.exceptions import EmptyResultSet
         from django.db.models.sql.constants import (
             CURSOR,
@@ -380,7 +394,7 @@ class AsyncPostgreSQLConnection:
                 return []
             return None
 
-        cursor = self.cursor()
+        cursor = self.chunked_cursor() if chunked_fetch else self.cursor()
         try:
             await cursor.execute(sql, params)
         except Exception as e:
@@ -609,6 +623,116 @@ class AsyncPostgreSQLConnection:
                     setattr(obj, field.name, rel_obj)
             objs.append(obj)
         return objs
+
+    async def aiter_model_queryset(
+        self,
+        queryset,
+        *,
+        chunked_fetch=False,
+        chunk_size=2000,
+    ):
+        import operator
+        from weakref import ref as weak_ref
+
+        from django.db.models.query import ModelIterable, get_related_populators
+        from django.db.models.sql.constants import CURSOR
+
+        if queryset._iterable_class is not ModelIterable:
+            raise NotImplementedError(
+                "Native async PostgreSQL iteration currently supports only "
+                "model querysets."
+            )
+
+        db = queryset.db
+        compiler = self.get_compiler(queryset.query)
+        cursor = await self.execute_compiler(
+            compiler,
+            result_type=CURSOR,
+            chunked_fetch=chunked_fetch,
+        )
+        select, klass_info, annotation_col_map = (
+            compiler.select,
+            compiler.klass_info,
+            compiler.annotation_col_map,
+        )
+        model_cls = klass_info["model"]
+        select_fields = klass_info["select_fields"]
+        model_fields_start, model_fields_end = select_fields[0], select_fields[-1] + 1
+        init_list = [
+            f[0].target.attname for f in select[model_fields_start:model_fields_end]
+        ]
+        related_populators = get_related_populators(
+            klass_info,
+            select,
+            db,
+            queryset._fetch_mode,
+        )
+        known_related_objects = [
+            (
+                field,
+                related_objs,
+                attnames := [
+                    (
+                        field.attname
+                        if from_field == "self"
+                        else queryset.model._meta.get_field(from_field).attname
+                    )
+                    for from_field in field.from_fields
+                ],
+                operator.attrgetter(*attnames),
+            )
+            for field, related_objs in queryset._known_related_objects.items()
+        ]
+        fields = [s[0] for s in select[0 : compiler.col_count]]
+        converters = compiler.get_converters(fields)
+        has_composite_fields = compiler.has_composite_fields(fields)
+        peers = []
+        try:
+            while True:
+                rows = await cursor.fetchmany(chunk_size)
+                if not rows:
+                    break
+                if compiler.has_extra_select and compiler.col_count is not None:
+                    rows = [row[0 : compiler.col_count] for row in rows]
+                if converters:
+                    rows = compiler.apply_converters(rows, converters)
+                if has_composite_fields:
+                    rows = compiler.composite_fields_to_tuples(rows, fields)
+                for row in rows:
+                    obj = model_cls.from_db(
+                        db,
+                        init_list,
+                        row[model_fields_start:model_fields_end],
+                        fetch_mode=queryset._fetch_mode,
+                    )
+                    if queryset._fetch_mode.track_peers:
+                        peers.append(weak_ref(obj))
+                        obj._state.peers = peers
+                    for rel_populator in related_populators:
+                        rel_populator.populate(row, obj)
+                    if annotation_col_map:
+                        for attr_name, col_pos in annotation_col_map.items():
+                            setattr(obj, attr_name, row[col_pos])
+                    for (
+                        field,
+                        rel_objs,
+                        rel_attnames,
+                        rel_getter,
+                    ) in known_related_objects:
+                        if field.is_cached(obj):
+                            continue
+                        if any(attname not in obj.__dict__ for attname in rel_attnames):
+                            continue
+                        rel_obj_id = rel_getter(obj)
+                        try:
+                            rel_obj = rel_objs[rel_obj_id]
+                        except KeyError:
+                            pass
+                        else:
+                            setattr(obj, field.name, rel_obj)
+                    yield obj
+        finally:
+            await cursor.close()
 
     def _make_savepoint_id(self):
         try:
