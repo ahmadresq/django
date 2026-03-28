@@ -198,6 +198,9 @@ class AsyncPostgreSQLConnection:
         self.rollback_exc = None
         self.closed_in_transaction = False
 
+    def __getattr__(self, attr):
+        return getattr(self.db, attr)
+
     @classmethod
     async def connect(cls, db, *, autocommit=None):
         conn_params = db.get_async_connection_params()
@@ -348,6 +351,252 @@ class AsyncPostgreSQLConnection:
                 "An error occurred in the current transaction. You can't "
                 "execute queries until the end of the 'atomic' block."
             ) from self.rollback_exc
+
+    def get_compiler(self, query, *, elide_empty=True):
+        return self.ops.compiler(query.compiler)(
+            query,
+            self,
+            self.alias,
+            elide_empty,
+        )
+
+    async def execute_compiler(self, compiler, *, result_type):
+        from django.core.exceptions import EmptyResultSet
+        from django.db.models.sql.constants import CURSOR, MULTI, NO_RESULTS, ROW_COUNT
+
+        result_type = result_type or NO_RESULTS
+        try:
+            sql, params = compiler.as_sql()
+            if not sql:
+                raise EmptyResultSet
+        except EmptyResultSet:
+            if result_type == MULTI:
+                return []
+            return None
+
+        cursor = self.cursor()
+        try:
+            await cursor.execute(sql, params)
+        except Exception as e:
+            try:
+                await cursor.close()
+            except self.db.Database.Error:
+                raise e from None
+            raise
+
+        if result_type == ROW_COUNT:
+            try:
+                return cursor.rowcount
+            finally:
+                await cursor.close()
+        if result_type == CURSOR:
+            return cursor
+        if result_type == NO_RESULTS:
+            await cursor.close()
+            return None
+
+        try:
+            if result_type == "single":
+                row = await cursor.fetchone()
+                if row:
+                    return row[0 : compiler.col_count]
+                return row
+
+            rows = await cursor.fetchall()
+            if compiler.has_extra_select and compiler.col_count is not None:
+                rows = [row[0 : compiler.col_count] for row in rows]
+            return [rows]
+        finally:
+            await cursor.close()
+
+    async def execute_insert_query(self, query, returning_fields=None):
+        from django.db.models import AutoField
+
+        compiler = self.get_compiler(query)
+        assert not (
+            returning_fields
+            and len(query.objs) != 1
+            and not self.features.can_return_rows_from_bulk_insert
+        )
+        opts = query.get_meta()
+        compiler.returning_fields = returning_fields
+        cols = []
+        async with self.cursor() as cursor:
+            for sql, params in compiler.as_sql():
+                await cursor.execute(sql, params)
+            if not compiler.returning_fields:
+                return []
+            obj_len = len(query.objs)
+            if (
+                self.features.can_return_rows_from_bulk_insert
+                and obj_len > 1
+            ) or (
+                self.features.can_return_columns_from_insert and obj_len == 1
+            ):
+                rows = await cursor.fetchall()
+                cols = [field.get_col(opts.db_table) for field in compiler.returning_fields]
+            elif returning_fields and isinstance(
+                returning_field := returning_fields[0], AutoField
+            ):
+                cols = [returning_field.get_col(opts.db_table)]
+                rows = [
+                    (
+                        self.ops.last_insert_id(
+                            cursor,
+                            opts.db_table,
+                            returning_field.column,
+                        ),
+                    )
+                ]
+            else:
+                return []
+
+        converters = compiler.get_converters(cols)
+        if converters:
+            rows = compiler.apply_converters(rows, converters)
+        return list(rows)
+
+    async def execute_update_query(self, query, returning_fields=None):
+        from django.db.models.sql.constants import ROW_COUNT
+
+        compiler = self.get_compiler(query)
+        if returning_fields is None:
+            row_count = await self.execute_compiler(compiler, result_type=ROW_COUNT)
+            is_empty = row_count is None
+            row_count = row_count or 0
+
+            for related_query in query.get_related_updates():
+                aux_row_count = await self.execute_update_query(related_query)
+                if is_empty and aux_row_count:
+                    row_count = aux_row_count
+                    is_empty = False
+            return row_count
+
+        if query.get_related_updates():
+            raise NotImplementedError(
+                "Update returning is not implemented for queries with related updates."
+            )
+        if not returning_fields or not self.features.can_return_rows_from_update:
+            row_count = await self.execute_update_query(query)
+            return [()] * row_count
+
+        compiler.returning_fields = returning_fields
+        async with self.cursor() as cursor:
+            sql, params = compiler.as_sql()
+            await cursor.execute(sql, params)
+            rows = await cursor.fetchall()
+
+        opts = query.get_meta()
+        cols = [field.get_col(opts.db_table) for field in compiler.returning_fields]
+        converters = compiler.get_converters(cols)
+        if converters:
+            rows = compiler.apply_converters(rows, converters)
+        return list(rows)
+
+    async def count_queryset(self, queryset):
+        from django.core.exceptions import EmptyResultSet
+
+        compiler = self.get_compiler(queryset.query)
+        try:
+            sql, params = compiler.as_sql()
+            if not sql:
+                raise EmptyResultSet
+        except EmptyResultSet:
+            return 0
+
+        async with self.cursor() as cursor:
+            await cursor.execute(f"SELECT COUNT(*) FROM ({sql}) subquery", params)
+            row = await cursor.fetchone()
+        return row[0]
+
+    async def fetch_model_queryset(self, queryset):
+        import operator
+        from itertools import chain
+        from weakref import ref as weak_ref
+
+        from django.db.models.query import ModelIterable, get_related_populators
+        from django.db.models.sql.constants import MULTI
+
+        if queryset._iterable_class is not ModelIterable:
+            raise NotImplementedError(
+                "Native async PostgreSQL get() currently supports only model querysets."
+            )
+
+        db = queryset.db
+        compiler = self.get_compiler(queryset.query)
+        results = await self.execute_compiler(compiler, result_type=MULTI)
+        select, klass_info, annotation_col_map = (
+            compiler.select,
+            compiler.klass_info,
+            compiler.annotation_col_map,
+        )
+        model_cls = klass_info["model"]
+        select_fields = klass_info["select_fields"]
+        model_fields_start, model_fields_end = select_fields[0], select_fields[-1] + 1
+        init_list = [
+            f[0].target.attname for f in select[model_fields_start:model_fields_end]
+        ]
+        related_populators = get_related_populators(
+            klass_info,
+            select,
+            db,
+            queryset._fetch_mode,
+        )
+        known_related_objects = [
+            (
+                field,
+                related_objs,
+                attnames := [
+                    (
+                        field.attname
+                        if from_field == "self"
+                        else queryset.model._meta.get_field(from_field).attname
+                    )
+                    for from_field in field.from_fields
+                ],
+                operator.attrgetter(*attnames),
+            )
+            for field, related_objs in queryset._known_related_objects.items()
+        ]
+        fields = [s[0] for s in select[0 : compiler.col_count]]
+        rows = chain.from_iterable(results)
+        converters = compiler.get_converters(fields)
+        if converters:
+            rows = compiler.apply_converters(rows, converters)
+        if compiler.has_composite_fields(fields):
+            rows = compiler.composite_fields_to_tuples(rows, fields)
+
+        objs = []
+        peers = []
+        for row in rows:
+            obj = model_cls.from_db(
+                db,
+                init_list,
+                row[model_fields_start:model_fields_end],
+                fetch_mode=queryset._fetch_mode,
+            )
+            if queryset._fetch_mode.track_peers:
+                peers.append(weak_ref(obj))
+                obj._state.peers = peers
+            for rel_populator in related_populators:
+                rel_populator.populate(row, obj)
+            if annotation_col_map:
+                for attr_name, col_pos in annotation_col_map.items():
+                    setattr(obj, attr_name, row[col_pos])
+            for field, rel_objs, rel_attnames, rel_getter in known_related_objects:
+                if field.is_cached(obj):
+                    continue
+                if any(attname not in obj.__dict__ for attname in rel_attnames):
+                    continue
+                rel_obj_id = rel_getter(obj)
+                try:
+                    rel_obj = rel_objs[rel_obj_id]
+                except KeyError:
+                    pass
+                else:
+                    setattr(obj, field.name, rel_obj)
+            objs.append(obj)
+        return objs
 
     def _make_savepoint_id(self):
         try:
