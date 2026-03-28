@@ -1244,6 +1244,15 @@ class QuerySet(AltersData):
             return obj
 
     async def afirst(self):
+        if self._async_connection is not None:
+            if self.ordered or not self.query.default_ordering:
+                queryset = self
+            else:
+                self._check_ordering_first_last_queryset_aggregation(method="first")
+                queryset = self.order_by("pk")
+            limited = queryset[:1]
+            results = await limited._async_connection.fetch_model_queryset(limited)
+            return results[0] if results else None
         return await sync_to_async(self.first)()
 
     def last(self):
@@ -1257,6 +1266,15 @@ class QuerySet(AltersData):
             return obj
 
     async def alast(self):
+        if self._async_connection is not None:
+            if self.ordered or not self.query.default_ordering:
+                queryset = self.reverse()
+            else:
+                self._check_ordering_first_last_queryset_aggregation(method="last")
+                queryset = self.order_by("-pk")
+            limited = queryset[:1]
+            results = await limited._async_connection.fetch_model_queryset(limited)
+            return results[0] if results else None
         return await sync_to_async(self.last)()
 
     def in_bulk(self, id_list=None, *, field_name="pk"):
@@ -1490,6 +1508,10 @@ class QuerySet(AltersData):
         return bool(self._result_cache)
 
     async def aexists(self):
+        if self._async_connection is not None:
+            if self._result_cache is None:
+                return await self._async_connection.has_results_queryset(self)
+            return bool(self._result_cache)
         return await sync_to_async(self.exists)()
 
     def contains(self, obj):
