@@ -439,7 +439,20 @@ class QuerySet(AltersData):
         # Remember, __aiter__ itself is synchronous, it's the thing it returns
         # that is async!
         async def generator():
-            await sync_to_async(self._fetch_all)()
+            if self._result_cache is None:
+                if (
+                    self._async_connection is not None
+                    and self._iterable_class is ModelIterable
+                ):
+                    if self._prefetch_related_lookups:
+                        self._result_cache = [item async for item in self.aiterator()]
+                        self._prefetch_done = True
+                    else:
+                        self._result_cache = await self._async_connection.fetch_model_queryset(
+                            self
+                        )
+                else:
+                    await sync_to_async(self._fetch_all)()
             for item in self._result_cache:
                 yield item
 
@@ -587,9 +600,19 @@ class QuerySet(AltersData):
         use_chunked_fetch = not connections[self.db].settings_dict.get(
             "DISABLE_SERVER_SIDE_CURSORS"
         )
-        iterable = self._iterable_class(
-            self, chunked_fetch=use_chunked_fetch, chunk_size=chunk_size
-        )
+        if (
+            self._async_connection is not None
+            and self._iterable_class is ModelIterable
+        ):
+            iterable = self._async_connection.aiter_model_queryset(
+                self,
+                chunked_fetch=use_chunked_fetch,
+                chunk_size=chunk_size,
+            )
+        else:
+            iterable = self._iterable_class(
+                self, chunked_fetch=use_chunked_fetch, chunk_size=chunk_size
+            )
         if self._prefetch_related_lookups:
             results = []
 

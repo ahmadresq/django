@@ -322,3 +322,50 @@ class PostgreSQLAsyncSupportTests(TransactionTestCase):
 
         self.assertEqual(first_obj.pk, first_created.pk)
         self.assertEqual(last_obj.pk, second_created.pk)
+
+    async def test_native_async_queryset_async_for_uses_native_connection(self):
+        async with await connection.new_async_connection() as async_connection:
+            queryset = CharFieldModel.objects.all().using_async_connection(
+                async_connection
+            )
+            await queryset.acreate(field="beta")
+            await queryset.acreate(field="alpha")
+            ordered = queryset.order_by("field")
+
+            with unittest.mock.patch(
+                "django.db.models.query.sync_to_async",
+                side_effect=AssertionError("sync_to_async bridge should not be used"),
+            ):
+                values = [obj.field async for obj in ordered]
+                cached_values = [obj.field async for obj in ordered]
+
+        self.assertEqual(values, ["alpha", "beta"])
+        self.assertEqual(cached_values, values)
+
+    async def test_native_async_queryset_aiterator_uses_chunked_cursor(self):
+        async with await connection.new_async_connection() as async_connection:
+            queryset = CharFieldModel.objects.all().using_async_connection(
+                async_connection
+            )
+            await queryset.acreate(field="alpha")
+            await queryset.acreate(field="beta")
+            await queryset.acreate(field="gamma")
+            ordered = queryset.order_by("pk")
+
+            with (
+                unittest.mock.patch(
+                    "django.db.models.query.sync_to_async",
+                    side_effect=AssertionError(
+                        "sync_to_async bridge should not be used"
+                    ),
+                ),
+                unittest.mock.patch.object(
+                    async_connection,
+                    "chunked_cursor",
+                    wraps=async_connection.chunked_cursor,
+                ) as chunked_cursor,
+            ):
+                values = [obj.field async for obj in ordered.aiterator(chunk_size=1)]
+
+        self.assertEqual(values, ["alpha", "beta", "gamma"])
+        self.assertEqual(chunked_cursor.call_count, 1)
