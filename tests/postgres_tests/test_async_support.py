@@ -489,3 +489,49 @@ class PostgreSQLAsyncSupportTests(TransactionTestCase):
 
         self.assertEqual(rows, 1)
         self.assertEqual(updated.field, "beta")
+
+    async def test_native_async_queryset_aget_or_create_uses_native_connection(self):
+        async with await connection.new_async_connection() as async_connection:
+            queryset = CharFieldModel.objects.all().using_async_connection(
+                async_connection
+            )
+
+            with unittest.mock.patch(
+                "django.db.models.query.sync_to_async",
+                side_effect=AssertionError("sync_to_async bridge should not be used"),
+            ):
+                created_obj, created = await queryset.aget_or_create(field="alpha")
+                fetched_obj, fetched_created = await queryset.aget_or_create(
+                    field="alpha"
+                )
+
+        self.assertIs(created, True)
+        self.assertIs(fetched_created, False)
+        self.assertEqual(fetched_obj.pk, created_obj.pk)
+        self.assertEqual(fetched_obj.field, "alpha")
+
+    async def test_native_async_queryset_aupdate_or_create_uses_native_connection(self):
+        async with await connection.new_async_connection() as async_connection:
+            queryset = CharFieldModel.objects.all().using_async_connection(
+                async_connection
+            )
+            existing = await queryset.acreate(field="alpha")
+
+            with unittest.mock.patch(
+                "django.db.models.query.sync_to_async",
+                side_effect=AssertionError("sync_to_async bridge should not be used"),
+            ):
+                updated_obj, updated_created = await queryset.aupdate_or_create(
+                    pk=existing.pk,
+                    defaults={"field": "beta"},
+                )
+                created_obj, created = await queryset.aupdate_or_create(
+                    field="gamma",
+                    defaults={"field": "gamma"},
+                )
+
+        self.assertIs(updated_created, False)
+        self.assertEqual(updated_obj.pk, existing.pk)
+        self.assertEqual(updated_obj.field, "beta")
+        self.assertIs(created, True)
+        self.assertEqual(created_obj.field, "gamma")
