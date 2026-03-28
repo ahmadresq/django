@@ -1,6 +1,7 @@
+import asyncio
 import unittest
 
-from django.db import connection
+from django.db import DatabaseError, connection, transaction
 from django.test import TransactionTestCase, modify_settings
 
 try:
@@ -9,11 +10,27 @@ except ImportError:
     is_psycopg3 = False
 
 
+class AsyncAtomicTestError(Exception):
+    pass
+
+
 @unittest.skipUnless(connection.vendor == "postgresql", "PostgreSQL specific tests")
 @unittest.skipUnless(is_psycopg3, "Native async PostgreSQL support requires psycopg 3")
 @modify_settings(INSTALLED_APPS={"append": "django.contrib.postgres"})
 class PostgreSQLAsyncSupportTests(TransactionTestCase):
     available_apps = ["django.contrib.postgres"]
+
+    async def _reset_table(self, async_connection, table_name):
+        await async_connection.execute(f"DROP TABLE IF EXISTS {table_name}")
+        await async_connection.execute(
+            f"CREATE TABLE {table_name} (id serial PRIMARY KEY, value integer)"
+        )
+
+    async def _count_rows(self, async_connection, table_name):
+        async with async_connection.cursor() as cursor:
+            await cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
+            row = await cursor.fetchone()
+        return row
 
     async def test_new_async_connection_execute_and_fetchone(self):
         async with await connection.new_async_connection() as async_connection:
@@ -78,3 +95,142 @@ class PostgreSQLAsyncSupportTests(TransactionTestCase):
                 row = await cursor.fetchone()
 
         self.assertEqual(row, (0,))
+
+    async def test_async_atomic_commits_transaction(self):
+        table_name = "async_support_atomic_commit"
+        async with await connection.new_async_connection() as async_connection:
+            await self._reset_table(async_connection, table_name)
+
+            async with async_connection.atomic():
+                await async_connection.execute(
+                    f"INSERT INTO {table_name} (value) VALUES (1)"
+                )
+
+            row = await self._count_rows(async_connection, table_name)
+            await async_connection.execute(f"DROP TABLE {table_name}")
+
+        self.assertEqual(row, (1,))
+
+    async def test_async_atomic_rolls_back_on_exception(self):
+        table_name = "async_support_atomic_rollback"
+        async with await connection.new_async_connection() as async_connection:
+            await self._reset_table(async_connection, table_name)
+
+            with self.assertRaisesMessage(AsyncAtomicTestError, "Oops"):
+                async with async_connection.atomic():
+                    await async_connection.execute(
+                        f"INSERT INTO {table_name} (value) VALUES (1)"
+                    )
+                    raise AsyncAtomicTestError("Oops")
+
+            row = await self._count_rows(async_connection, table_name)
+            await async_connection.execute(f"DROP TABLE {table_name}")
+
+        self.assertEqual(row, (0,))
+
+    async def test_async_atomic_nested_savepoint_rolls_back_inner_block(self):
+        table_name = "async_support_atomic_savepoint"
+        async with await connection.new_async_connection() as async_connection:
+            await self._reset_table(async_connection, table_name)
+
+            async with async_connection.atomic():
+                await async_connection.execute(
+                    f"INSERT INTO {table_name} (value) VALUES (1)"
+                )
+                with self.assertRaisesMessage(AsyncAtomicTestError, "Oops"):
+                    async with async_connection.atomic():
+                        await async_connection.execute(
+                            f"INSERT INTO {table_name} (value) VALUES (2)"
+                        )
+                        raise AsyncAtomicTestError("Oops")
+                inner_row = await self._count_rows(async_connection, table_name)
+
+            outer_row = await self._count_rows(async_connection, table_name)
+            await async_connection.execute(f"DROP TABLE {table_name}")
+
+        self.assertEqual(inner_row, (1,))
+        self.assertEqual(outer_row, (1,))
+
+    async def test_async_atomic_savepoint_false_marks_transaction_for_rollback(self):
+        table_name = "async_support_atomic_broken"
+        msg = (
+            "An error occurred in the current transaction. You can't execute "
+            "queries until the end of the 'atomic' block."
+        )
+        async with await connection.new_async_connection() as async_connection:
+            await self._reset_table(async_connection, table_name)
+
+            async with async_connection.atomic():
+                await async_connection.execute(
+                    f"INSERT INTO {table_name} (value) VALUES (1)"
+                )
+                with self.assertRaisesMessage(AsyncAtomicTestError, "Oops"):
+                    async with async_connection.atomic(savepoint=False):
+                        await async_connection.execute(
+                            f"INSERT INTO {table_name} (value) VALUES (2)"
+                        )
+                        raise AsyncAtomicTestError("Oops")
+                self.assertTrue(async_connection.get_rollback())
+                with self.assertRaisesMessage(
+                    transaction.TransactionManagementError,
+                    msg,
+                ):
+                    await async_connection.execute(f"SELECT COUNT(*) FROM {table_name}")
+
+            row = await self._count_rows(async_connection, table_name)
+            await async_connection.execute(f"DROP TABLE {table_name}")
+
+        self.assertEqual(row, (0,))
+
+    async def test_async_atomic_rollback_on_cancelled_error(self):
+        table_name = "async_support_atomic_cancelled"
+        started = asyncio.Event()
+
+        async with await connection.new_async_connection() as async_connection:
+            await self._reset_table(async_connection, table_name)
+
+        async def worker():
+            async with await connection.new_async_connection() as worker_connection:
+                async with worker_connection.atomic():
+                    await worker_connection.execute(
+                        f"INSERT INTO {table_name} (value) VALUES (1)"
+                    )
+                    started.set()
+                    await asyncio.sleep(60)
+
+        task = asyncio.create_task(worker())
+        await started.wait()
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        async with await connection.new_async_connection() as verifier_connection:
+            row = await self._count_rows(verifier_connection, table_name)
+            await verifier_connection.execute(f"DROP TABLE {table_name}")
+
+        self.assertEqual(row, (0,))
+
+    async def test_async_atomic_select_for_update_nowait(self):
+        table_name = "async_support_atomic_for_update"
+        async with await connection.new_async_connection() as async_connection:
+            await self._reset_table(async_connection, table_name)
+            await async_connection.execute(
+                f"INSERT INTO {table_name} (value) VALUES (1)"
+            )
+
+            async with async_connection.atomic():
+                async with async_connection.cursor() as cursor:
+                    await cursor.execute(
+                        f"SELECT id FROM {table_name} WHERE value = 1 FOR UPDATE"
+                    )
+                    await cursor.fetchone()
+
+                async with await connection.new_async_connection() as other_connection:
+                    with self.assertRaises(DatabaseError):
+                        async with other_connection.atomic():
+                            await other_connection.execute(
+                                "SELECT id FROM "
+                                f"{table_name} WHERE value = 1 FOR UPDATE NOWAIT"
+                            )
+
+            await async_connection.execute(f"DROP TABLE {table_name}")
