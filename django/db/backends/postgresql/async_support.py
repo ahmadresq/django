@@ -535,6 +535,157 @@ class AsyncPostgreSQLConnection:
         compiler = self.get_compiler(queryset.query.exists())
         return bool(await self.execute_compiler(compiler, result_type=SINGLE))
 
+    async def aggregate_query(self, query, aggregate_exprs):
+        from django.db.models.expressions import Ref
+        from django.db.models.sql.constants import SINGLE
+
+        if not aggregate_exprs:
+            return {}
+
+        refs_subquery = False
+        refs_window = False
+        replacements = {}
+        annotation_select_mask = query.annotation_select_mask
+        for alias, aggregate_expr in aggregate_exprs.items():
+            query.check_alias(alias)
+            aggregate = aggregate_expr.resolve_expression(
+                query, allow_joins=True, reuse=None, summarize=True
+            )
+            if not aggregate.contains_aggregate:
+                raise TypeError(f"{alias} is not an aggregate expression")
+            query.append_annotation_mask([alias])
+            aggregate_refs = aggregate.get_refs()
+            refs_subquery |= any(
+                getattr(query.annotations[ref], "contains_subquery", False)
+                for ref in aggregate_refs
+            )
+            refs_window |= any(
+                getattr(query.annotations[ref], "contains_over_clause", True)
+                for ref in aggregate_refs
+            )
+            aggregate = aggregate.replace_expressions(replacements)
+            query.annotations[alias] = aggregate
+            replacements[Ref(alias, aggregate)] = aggregate
+
+        aggregates = {alias: query.annotations.pop(alias) for alias in aggregate_exprs}
+        query.set_annotation_mask(annotation_select_mask)
+        _, having, qualify = query.where.split_having_qualify()
+        has_existing_aggregation = (
+            any(
+                getattr(annotation, "contains_aggregate", True)
+                for annotation in query.annotations.values()
+            )
+            or having
+        )
+        set_returning_annotations = {
+            alias
+            for alias, annotation in query.annotation_select.items()
+            if getattr(annotation, "set_returning", False)
+        }
+        if (
+            isinstance(query.group_by, tuple)
+            or query.is_sliced
+            or has_existing_aggregation
+            or refs_subquery
+            or refs_window
+            or qualify
+            or query.distinct
+            or query.combinator
+            or set_returning_annotations
+        ):
+            from django.db.models.sql.subqueries import AggregateQuery
+
+            inner_query = query.clone()
+            inner_query.subquery = True
+            outer_query = AggregateQuery(query.model, inner_query)
+            inner_query.select_for_update = False
+            inner_query.select_related = False
+            inner_query.set_annotation_mask(query.annotation_select)
+            if inner_query.orderby_issubset_groupby:
+                inner_query.clear_ordering(force=False)
+            if not inner_query.distinct:
+                if inner_query.default_cols and has_existing_aggregation:
+                    inner_query.group_by = (
+                        query.model._meta.pk.get_col(inner_query.get_initial_alias()),
+                    )
+                inner_query.default_cols = False
+                if not qualify and not query.combinator:
+                    annotation_mask = set()
+                    if isinstance(query.group_by, tuple):
+                        for expr in query.group_by:
+                            annotation_mask |= expr.get_refs()
+                    for aggregate in aggregates.values():
+                        annotation_mask |= aggregate.get_refs()
+                    for annotation_alias, annotation in query.annotation_select.items():
+                        if annotation.get_group_by_cols():
+                            annotation_mask.add(annotation_alias)
+                    inner_query.set_annotation_mask(annotation_mask)
+                    annotation_mask |= set_returning_annotations
+
+            col_refs = {}
+            for alias, aggregate in aggregates.items():
+                replacements = {}
+                for col in query._gen_cols([aggregate], resolve_refs=False):
+                    if not (col_ref := col_refs.get(col)):
+                        index = len(col_refs) + 1
+                        col_alias = f"__col{index}"
+                        col_ref = Ref(col_alias, col)
+                        col_refs[col] = col_ref
+                        inner_query.add_annotation(col, col_alias)
+                    replacements[col] = col_ref
+                outer_query.annotations[alias] = aggregate.replace_expressions(
+                    replacements
+                )
+            if (
+                inner_query.select == ()
+                and not inner_query.default_cols
+                and not inner_query.annotation_select_mask
+            ):
+                inner_query.select = (
+                    query.model._meta.pk.get_col(inner_query.get_initial_alias()),
+                )
+        else:
+            outer_query = query
+            query.select = ()
+            query.selected = None
+            query.default_cols = False
+            query.extra = {}
+            if query.annotations:
+                replacements = {
+                    Ref(alias, annotation): annotation
+                    for alias, annotation in query.annotations.items()
+                }
+                query.annotations = {
+                    alias: aggregate.replace_expressions(replacements)
+                    for alias, aggregate in aggregates.items()
+                }
+            else:
+                query.annotations = aggregates
+            query.set_annotation_mask(aggregates)
+
+        empty_set_result = [
+            expression.empty_result_set_value
+            for expression in outer_query.annotation_select.values()
+        ]
+        elide_empty = not any(result is NotImplemented for result in empty_set_result)
+        outer_query.clear_ordering(force=True)
+        outer_query.clear_limits()
+        outer_query.select_for_update = False
+        outer_query.select_related = False
+        compiler = self.get_compiler(outer_query, elide_empty=elide_empty)
+        result = await self.execute_compiler(compiler, result_type=SINGLE)
+        if result is None:
+            result = empty_set_result
+        else:
+            cols = outer_query.annotation_select.values()
+            converters = compiler.get_converters(cols)
+            rows = compiler.apply_converters((result,), converters)
+            if compiler.has_composite_fields(cols):
+                rows = compiler.composite_fields_to_tuples(rows, cols)
+            result = next(rows)
+
+        return dict(zip(outer_query.annotation_select, result))
+
     def _values_queryset_names(self, queryset):
         query = queryset.query
         if query.selected:
