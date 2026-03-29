@@ -2,10 +2,10 @@ import asyncio
 import unittest
 
 from django.db import DatabaseError, connection, transaction
-from django.db.models import Count, Max
+from django.db.models import Count, Max, Prefetch
 from django.test import TransactionTestCase, modify_settings
 
-from .models import CharFieldModel
+from .models import Character, CharFieldModel, Line, Scene
 
 try:
     from django.db.backends.postgresql.psycopg_any import is_psycopg3
@@ -663,3 +663,82 @@ class PostgreSQLAsyncSupportTests(TransactionTestCase):
                 created[1].pk: "beta",
             },
         )
+
+    async def test_native_async_queryset_prefetch_related_aget_uses_native_connection(
+        self,
+    ):
+        async with await connection.new_async_connection() as async_connection:
+            scene_queryset = Scene.objects.all().using_async_connection(async_connection)
+            character_queryset = Character.objects.all().using_async_connection(
+                async_connection
+            )
+            queryset = Line.objects.all().using_async_connection(async_connection)
+            scene = await scene_queryset.acreate(scene="Intro", setting="Castle")
+            character = await character_queryset.acreate(name="Arthur")
+            line = await queryset.acreate(
+                scene=scene,
+                character=character,
+                dialogue="Bring out your dead.",
+            )
+
+            with unittest.mock.patch(
+                "django.db.models.query.sync_to_async",
+                side_effect=AssertionError("sync_to_async bridge should not be used"),
+            ):
+                fetched = await queryset.prefetch_related("scene", "character").aget(
+                    pk=line.pk
+                )
+
+        self.assertTrue(Line._meta.get_field("scene").is_cached(fetched))
+        self.assertTrue(Line._meta.get_field("character").is_cached(fetched))
+        self.assertEqual(fetched.scene.setting, "Castle")
+        self.assertEqual(fetched.character.name, "Arthur")
+
+    async def test_native_async_queryset_prefetch_related_prefetch_object_uses_native_connection(
+        self,
+    ):
+        async with await connection.new_async_connection() as async_connection:
+            scene_queryset = Scene.objects.all().using_async_connection(async_connection)
+            character_queryset = Character.objects.all().using_async_connection(
+                async_connection
+            )
+            queryset = Line.objects.all().using_async_connection(async_connection)
+            first_scene = await scene_queryset.acreate(
+                scene="Intro",
+                setting="Castle",
+            )
+            second_scene = await scene_queryset.acreate(
+                scene="Outro",
+                setting="Village",
+            )
+            character = await character_queryset.acreate(name="Patsy")
+            await queryset.abulk_create(
+                [
+                    Line(
+                        scene=second_scene,
+                        character=character,
+                        dialogue="It is but a scratch.",
+                    ),
+                    Line(
+                        scene=first_scene,
+                        character=character,
+                        dialogue="Ni!",
+                    ),
+                ]
+            )
+
+            with unittest.mock.patch(
+                "django.db.models.query.sync_to_async",
+                side_effect=AssertionError("sync_to_async bridge should not be used"),
+            ):
+                fetched = await queryset.order_by("dialogue").prefetch_related(
+                    Prefetch(
+                        "scene",
+                        queryset=Scene.objects.filter(setting="Castle"),
+                        to_attr="prefetched_scene",
+                    )
+                ).afirst()
+
+        self.assertEqual(fetched.dialogue, "It is but a scratch.")
+        self.assertTrue(hasattr(fetched, "prefetched_scene"))
+        self.assertIsNone(fetched.prefetched_scene)
