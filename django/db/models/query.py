@@ -26,7 +26,16 @@ from django.db import (
 from django.db.models import AutoField, DateField, DateTimeField, Field, Max, sql
 from django.db.models.constants import LOOKUP_SEP, OnConflict
 from django.db.models.deletion import Collector
-from django.db.models.expressions import Case, DatabaseDefault, F, OrderBy, Value, When
+from django.db.models.expressions import (
+    Case,
+    ColPairs,
+    DatabaseDefault,
+    F,
+    OrderBy,
+    Value,
+    When,
+)
+from django.db.models.fields.tuple_lookups import TupleIn
 from django.db.models.fetch_modes import FETCH_ONE
 from django.db.models.functions import Cast, Trunc
 from django.db.models.query_utils import FilteredRelation, Q
@@ -605,18 +614,22 @@ class QuerySet(AltersData):
             results = []
 
             async for item in iterable:
-                results.append(item)
-                if len(results) >= chunk_size:
-                    await aprefetch_related_objects(
-                        results, *self._prefetch_related_lookups
-                    )
-                    for result in results:
-                        yield result
-                    results.clear()
+                    results.append(item)
+                    if len(results) >= chunk_size:
+                        await aprefetch_related_objects(
+                            results,
+                            *self._prefetch_related_lookups,
+                            async_connection=self._async_connection,
+                        )
+                        for result in results:
+                            yield result
+                        results.clear()
 
             if results:
                 await aprefetch_related_objects(
-                    results, *self._prefetch_related_lookups
+                    results,
+                    *self._prefetch_related_lookups,
+                    async_connection=self._async_connection,
                 )
                 for result in results:
                     yield result
@@ -2846,7 +2859,9 @@ class QuerySet(AltersData):
             and issubclass(self._iterable_class, ModelIterable)
         ):
             await aprefetch_related_objects(
-                self._result_cache, *self._prefetch_related_lookups
+                self._result_cache,
+                *self._prefetch_related_lookups,
+                async_connection=self._async_connection,
             )
             self._prefetch_done = True
 
@@ -3359,8 +3374,202 @@ def prefetch_related_objects(model_instances, *related_lookups):
                 obj_list = new_obj_list
 
 
-async def aprefetch_related_objects(model_instances, *related_lookups):
+def _bind_async_prefetch_queryset(queryset, async_connection):
+    if getattr(queryset, "_async_connection", None) is None:
+        return queryset.using_async_connection(async_connection)
+    if queryset._async_connection.alias != async_connection.alias:
+        raise ValueError(
+            "The queryset is bound to async connection alias %r but the prefetch "
+            "path is using alias %r."
+            % (queryset._async_connection.alias, async_connection.alias)
+        )
+    return queryset
+
+
+async def _aprefetch_one_level_native(instances, prefetcher, lookup, level, async_connection):
+    from django.db.models.fields.related_descriptors import (
+        ForwardManyToOneDescriptor,
+        ForwardOneToOneDescriptor,
+        ReverseOneToOneDescriptor,
+    )
+
+    current_querysets = lookup.get_current_querysets(level)
+    if current_querysets:
+        if len(current_querysets) != 1:
+            raise ValueError(
+                "querysets argument of get_prefetch_querysets() should have a "
+                "length of 1."
+            )
+        queryset = current_querysets[0]
+    elif isinstance(prefetcher, (ForwardManyToOneDescriptor, ForwardOneToOneDescriptor)):
+        queryset = prefetcher.get_queryset(instance=instances[0])
+    elif isinstance(prefetcher, ReverseOneToOneDescriptor):
+        queryset = prefetcher.get_queryset(instance=instances[0])
+    else:
+        raise NotImplementedError
+
+    queryset = _bind_async_prefetch_queryset(queryset, async_connection)
+
+    if isinstance(prefetcher, (ForwardManyToOneDescriptor, ForwardOneToOneDescriptor)):
+        rel_obj_attr = prefetcher.field.get_foreign_related_value
+        instance_attr = prefetcher.field.get_local_related_value
+        instances_dict = {instance_attr(inst): inst for inst in instances}
+        related_fields = [
+            queryset.query.resolve_ref(field.name).target
+            for field in prefetcher.field.foreign_related_fields
+        ]
+        queryset = queryset.filter(
+            TupleIn(
+                ColPairs(
+                    queryset.model._meta.db_table,
+                    related_fields,
+                    related_fields,
+                    prefetcher.field,
+                ),
+                list(instances_dict),
+            )
+        )
+        queryset.query.clear_ordering()
+        await queryset._afetch_all()
+        all_related_objects = queryset._result_cache
+        remote_field = prefetcher.field.remote_field
+        if not remote_field.multiple:
+            for rel_obj in all_related_objects:
+                instance = instances_dict[rel_obj_attr(rel_obj)]
+                remote_field.set_cached_value(rel_obj, instance)
+        single = True
+        cache_name = prefetcher.field.cache_name
+        is_descriptor = False
+    elif isinstance(prefetcher, ReverseOneToOneDescriptor):
+        rel_obj_attr = prefetcher.related.field.get_local_related_value
+        instance_attr = prefetcher.related.field.get_foreign_related_value
+        instances_dict = {instance_attr(inst): inst for inst in instances}
+        queryset = queryset.filter(**{f"{prefetcher.related.field.name}__in": instances})
+        queryset.query.clear_ordering()
+        await queryset._afetch_all()
+        all_related_objects = queryset._result_cache
+        for rel_obj in all_related_objects:
+            instance = instances_dict[rel_obj_attr(rel_obj)]
+            prefetcher.related.field.set_cached_value(rel_obj, instance)
+        single = True
+        cache_name = prefetcher.related.cache_name
+        is_descriptor = False
+    else:
+        raise NotImplementedError
+
+    additional_lookups = [
+        copy.copy(additional_lookup)
+        for additional_lookup in getattr(queryset, "_prefetch_related_lookups", ())
+    ]
+    if additional_lookups:
+        raise NotImplementedError
+
+    to_attr, as_attr = lookup.get_current_to_attr(level)
+    if as_attr and instances:
+        model = instances[0].__class__
+        try:
+            model._meta.get_field(to_attr)
+        except exceptions.FieldDoesNotExist:
+            pass
+        else:
+            msg = "to_attr={} conflicts with a field on the {} model."
+            raise ValueError(msg.format(to_attr, model.__name__))
+
+    rel_obj_cache = {}
+    for rel_obj in all_related_objects:
+        rel_attr_val = rel_obj_attr(rel_obj)
+        rel_obj_cache.setdefault(rel_attr_val, []).append(rel_obj)
+
+    for obj in instances:
+        instance_attr_val = instance_attr(obj)
+        vals = rel_obj_cache.get(instance_attr_val, [])
+        val = vals[0] if vals else None
+        if as_attr:
+            setattr(obj, to_attr, val)
+        elif is_descriptor:
+            setattr(obj, cache_name, val)
+        else:
+            obj._state.fields_cache[cache_name] = val
+    return all_related_objects
+
+
+async def _aprefetch_related_objects_native(
+    model_instances, *related_lookups, async_connection
+):
+    if not model_instances:
+        return
+
+    all_lookups = normalize_prefetch_lookups(reversed(related_lookups))
+    done_queries = {}
+    while all_lookups:
+        lookup = all_lookups.pop()
+        if lookup.prefetch_to in done_queries:
+            if lookup.queryset is not None:
+                raise ValueError(
+                    "'%s' lookup was already seen with a different queryset. "
+                    "You may need to adjust the ordering of your lookups."
+                    % lookup.prefetch_to
+                )
+            continue
+
+        through_attrs = lookup.prefetch_through.split(LOOKUP_SEP)
+        if len(through_attrs) != 1:
+            raise NotImplementedError
+
+        obj_list = model_instances
+        for obj in obj_list:
+            if not hasattr(obj, "_prefetched_objects_cache"):
+                obj._prefetched_objects_cache = {}
+
+        through_attr = through_attrs[0]
+        first_obj = next(iter(obj_list))
+        to_attr = lookup.get_current_to_attr(0)[0]
+        prefetcher, descriptor, attr_found, is_fetched = get_prefetcher(
+            first_obj, through_attr, to_attr
+        )
+        if not attr_found:
+            raise AttributeError(
+                "Cannot find '%s' on %s object, '%s' is an invalid "
+                "parameter to prefetch_related()"
+                % (
+                    through_attr,
+                    first_obj.__class__.__name__,
+                    lookup.prefetch_through,
+                )
+            )
+        if prefetcher is None:
+            raise ValueError(
+                "'%s' does not resolve to an item that supports "
+                "prefetching - this is an invalid parameter to "
+                "prefetch_related()." % lookup.prefetch_through
+            )
+
+        obj_to_fetch = [obj for obj in obj_list if not is_fetched(obj)]
+        if not obj_to_fetch:
+            continue
+
+        done_queries[lookup.prefetch_to] = await _aprefetch_one_level_native(
+            obj_to_fetch,
+            prefetcher,
+            lookup,
+            0,
+            async_connection,
+        )
+
+
+async def aprefetch_related_objects(
+    model_instances, *related_lookups, async_connection=None
+):
     """See prefetch_related_objects()."""
+    if async_connection is not None:
+        try:
+            return await _aprefetch_related_objects_native(
+                model_instances,
+                *related_lookups,
+                async_connection=async_connection,
+            )
+        except NotImplementedError:
+            pass
     return await sync_to_async(prefetch_related_objects)(
         model_instances, *related_lookups
     )
