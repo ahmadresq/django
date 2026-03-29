@@ -440,22 +440,7 @@ class QuerySet(AltersData):
         # that is async!
         async def generator():
             if self._result_cache is None:
-                if (
-                    self._async_connection is not None
-                    and self._supports_native_async_result_shape()
-                ):
-                    if (
-                        self._prefetch_related_lookups
-                        and issubclass(self._iterable_class, ModelIterable)
-                    ):
-                        self._result_cache = [item async for item in self.aiterator()]
-                        self._prefetch_done = True
-                    else:
-                        self._result_cache = await self._async_connection.fetch_queryset(
-                            self
-                        )
-                else:
-                    await sync_to_async(self._fetch_all)()
+                await self._afetch_all()
             for item in self._result_cache:
                 yield item
 
@@ -756,9 +741,7 @@ class QuerySet(AltersData):
                 limit = MAX_GET_RESULTS
                 clone.query.set_limits(high=limit)
             if clone._supports_native_async_result_shape():
-                clone._result_cache = await clone._async_connection.fetch_queryset(
-                    clone
-                )
+                await clone._afetch_all()
             else:
                 return await sync_to_async(self.get)(*args, **kwargs)
             num = len(clone._result_cache)
@@ -1532,8 +1515,8 @@ class QuerySet(AltersData):
                 return limited[0] if limited else None
             if not limited._supports_native_async_result_shape():
                 return await sync_to_async(self.first)()
-            results = await limited._async_connection.fetch_queryset(limited)
-            return results[0] if results else None
+            await limited._afetch_all()
+            return limited._result_cache[0] if limited._result_cache else None
         return await sync_to_async(self.first)()
 
     def last(self):
@@ -1558,8 +1541,8 @@ class QuerySet(AltersData):
                 return limited[0] if limited else None
             if not limited._supports_native_async_result_shape():
                 return await sync_to_async(self.last)()
-            results = await limited._async_connection.fetch_queryset(limited)
-            return results[0] if results else None
+            await limited._afetch_all()
+            return limited._result_cache[0] if limited._result_cache else None
         return await sync_to_async(self.last)()
 
     def in_bulk(self, id_list=None, *, field_name="pk"):
@@ -1659,6 +1642,96 @@ class QuerySet(AltersData):
         return {get_key(obj): get_obj(obj) for obj in qs}
 
     async def ain_bulk(self, id_list=None, *, field_name="pk"):
+        if self._async_connection is not None:
+            if self.query.is_sliced:
+                raise TypeError("Cannot use 'limit' or 'offset' with in_bulk().")
+            if id_list is not None and not id_list:
+                return {}
+            opts = self.model._meta
+            unique_fields = [
+                constraint.fields[0]
+                for constraint in opts.total_unique_constraints
+                if len(constraint.fields) == 1
+            ]
+            if (
+                field_name != "pk"
+                and not opts.get_field(field_name).unique
+                and field_name not in unique_fields
+                and self.query.distinct_fields != (field_name,)
+            ):
+                raise ValueError(
+                    "in_bulk()'s field_name must be a unique field but %r isn't."
+                    % field_name
+                )
+
+            qs = self
+
+            def get_obj(obj):
+                return obj
+
+            if issubclass(self._iterable_class, ModelIterable):
+                get_key = operator.attrgetter(field_name)
+
+            elif issubclass(self._iterable_class, ValuesIterable):
+                if field_name not in self.query.values_select:
+                    qs = qs.values(field_name, *self.query.values_select)
+
+                    def get_obj(obj):  # noqa: F811
+                        del obj[field_name]
+                        return obj
+
+                get_key = operator.itemgetter(field_name)
+
+            elif issubclass(self._iterable_class, ValuesListIterable):
+                try:
+                    field_index = self.query.values_select.index(field_name)
+                except ValueError:
+                    field_index = 0
+                    if issubclass(self._iterable_class, NamedValuesListIterable):
+                        kwargs = {"named": True}
+                    else:
+                        kwargs = {}
+                        get_obj = operator.itemgetter(slice(1, None))
+                    qs = qs.values_list(field_name, *self.query.values_select, **kwargs)
+
+                get_key = operator.itemgetter(field_index)
+
+            elif issubclass(self._iterable_class, FlatValuesListIterable):
+                if self.query.values_select == (field_name,):
+                    get_key = get_obj
+                else:
+                    qs = qs.values_list(field_name, *self.query.values_select)
+                    get_key = operator.itemgetter(0)
+                    get_obj = operator.itemgetter(1)
+
+            else:
+                raise TypeError(
+                    f"in_bulk() cannot be used with {self._iterable_class.__name__}."
+                )
+
+            if id_list is not None:
+                filter_key = "{}__in".format(field_name)
+                id_list = tuple(id_list)
+                batch_size = self._async_connection.ops.bulk_batch_size(
+                    [opts.pk], id_list
+                )
+                if batch_size and batch_size < len(id_list):
+                    results = []
+                    for offset in range(0, len(id_list), batch_size):
+                        batch = id_list[offset : offset + batch_size]
+                        batch_queryset = qs.filter(**{filter_key: batch})
+                        await batch_queryset._afetch_all()
+                        results.extend(batch_queryset._result_cache)
+                    qs = results
+                else:
+                    qs = qs.filter(**{filter_key: id_list})
+                    await qs._afetch_all()
+                    qs = qs._result_cache
+            else:
+                qs = qs._chain()
+                await qs._afetch_all()
+                qs = qs._result_cache
+            return {get_key(obj): get_obj(obj) for obj in qs}
         return await sync_to_async(self.in_bulk)(
             id_list=id_list,
             field_name=field_name,
@@ -2747,6 +2820,35 @@ class QuerySet(AltersData):
         c._fields = self._fields
         c._async_connection = self._async_connection
         return c
+
+    async def _afetch_all(self):
+        if self._result_cache is None:
+            if (
+                self._async_connection is not None
+                and self._supports_native_async_result_shape()
+            ):
+                if (
+                    self._prefetch_related_lookups
+                    and issubclass(self._iterable_class, ModelIterable)
+                ):
+                    self._result_cache = [item async for item in self.aiterator()]
+                    self._prefetch_done = True
+                else:
+                    self._result_cache = await self._async_connection.fetch_queryset(
+                        self
+                    )
+            else:
+                await sync_to_async(self._fetch_all)()
+                return
+        if (
+            self._prefetch_related_lookups
+            and not self._prefetch_done
+            and issubclass(self._iterable_class, ModelIterable)
+        ):
+            await aprefetch_related_objects(
+                self._result_cache, *self._prefetch_related_lookups
+            )
+            self._prefetch_done = True
 
     def _fetch_all(self):
         if self._result_cache is None:
