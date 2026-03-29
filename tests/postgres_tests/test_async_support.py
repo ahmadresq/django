@@ -1000,3 +1000,67 @@ class PostgreSQLAsyncSupportTests(TransactionTestCase):
         self.assertEqual(updated_obj.character_id, second_character.pk)
         self.assertIs(created, True)
         self.assertEqual(created_obj.scene_id, scene.pk)
+
+    async def test_native_async_queryset_prefetch_related_reverse_fk_uses_native_connection(
+        self,
+    ):
+        async with await connection.new_async_connection() as async_connection:
+            scene_queryset = Scene.objects.all().using_async_connection(async_connection)
+            character_queryset = Character.objects.all().using_async_connection(
+                async_connection
+            )
+            line_queryset = Line.objects.all().using_async_connection(async_connection)
+            scene = await scene_queryset.acreate(scene="Camp", setting="Camp")
+            character = await character_queryset.acreate(name="Tim")
+            await line_queryset.abulk_create(
+                [
+                    Line(scene=scene, character=character, dialogue="Alpha"),
+                    Line(scene=scene, character=character, dialogue="Beta"),
+                ]
+            )
+
+            with unittest.mock.patch(
+                "django.db.models.query.sync_to_async",
+                side_effect=AssertionError("sync_to_async bridge should not be used"),
+            ):
+                fetched = await scene_queryset.prefetch_related("line_set").aget(
+                    pk=scene.pk
+                )
+
+        cached_queryset = fetched._prefetched_objects_cache["line_set"]
+        self.assertEqual(
+            sorted(line.dialogue for line in cached_queryset),
+            ["Alpha", "Beta"],
+        )
+
+    async def test_native_async_queryset_prefetch_related_reverse_fk_to_attr_uses_native_connection(
+        self,
+    ):
+        async with await connection.new_async_connection() as async_connection:
+            scene_queryset = Scene.objects.all().using_async_connection(async_connection)
+            character_queryset = Character.objects.all().using_async_connection(
+                async_connection
+            )
+            line_queryset = Line.objects.all().using_async_connection(async_connection)
+            scene = await scene_queryset.acreate(scene="Tower", setting="Tower")
+            character = await character_queryset.acreate(name="Concorde")
+            await line_queryset.abulk_create(
+                [
+                    Line(scene=scene, character=character, dialogue="Alpha"),
+                    Line(scene=scene, character=character, dialogue="Beta"),
+                ]
+            )
+
+            with unittest.mock.patch(
+                "django.db.models.query.sync_to_async",
+                side_effect=AssertionError("sync_to_async bridge should not be used"),
+            ):
+                fetched = await scene_queryset.prefetch_related(
+                    Prefetch(
+                        "line_set",
+                        queryset=Line.objects.filter(dialogue__startswith="B"),
+                        to_attr="filtered_lines",
+                    )
+                ).aget(pk=scene.pk)
+
+        self.assertEqual([line.dialogue for line in fetched.filtered_lines], ["Beta"])

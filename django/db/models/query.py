@@ -3393,8 +3393,14 @@ async def _aprefetch_one_level_native(instances, prefetcher, lookup, level, asyn
         ForwardManyToOneDescriptor,
         ForwardOneToOneDescriptor,
         ReverseOneToOneDescriptor,
+        _filter_prefetch_queryset,
     )
 
+    reverse_many_to_one = (
+        hasattr(prefetcher, "field")
+        and hasattr(prefetcher, "instance")
+        and not hasattr(prefetcher, "through")
+    )
     current_querysets = lookup.get_current_querysets(level)
     if current_querysets:
         if len(current_querysets) != 1:
@@ -3407,12 +3413,13 @@ async def _aprefetch_one_level_native(instances, prefetcher, lookup, level, asyn
         queryset = prefetcher.get_queryset(instance=instances[0])
     elif isinstance(prefetcher, ReverseOneToOneDescriptor):
         queryset = prefetcher.get_queryset(instance=instances[0])
+    elif reverse_many_to_one:
+        queryset = super(prefetcher.__class__, prefetcher).get_queryset()
     else:
         raise NotImplementedError
 
-    queryset = _bind_async_prefetch_queryset(queryset, async_connection)
-
     if isinstance(prefetcher, (ForwardManyToOneDescriptor, ForwardOneToOneDescriptor)):
+        queryset = _bind_async_prefetch_queryset(queryset, async_connection)
         rel_obj_attr = prefetcher.field.get_foreign_related_value
         instance_attr = prefetcher.field.get_local_related_value
         instances_dict = {instance_attr(inst): inst for inst in instances}
@@ -3456,6 +3463,23 @@ async def _aprefetch_one_level_native(instances, prefetcher, lookup, level, asyn
         single = True
         cache_name = prefetcher.related.cache_name
         is_descriptor = False
+    elif reverse_many_to_one:
+        queryset._add_hints(instance=instances[0])
+        queryset = queryset.using(queryset._db or prefetcher._db)
+        queryset = _filter_prefetch_queryset(queryset, prefetcher.field.name, instances)
+        queryset = _bind_async_prefetch_queryset(queryset, async_connection)
+        rel_obj_attr = prefetcher.field.get_local_related_value
+        instance_attr = prefetcher.field.get_foreign_related_value
+        instances_dict = {instance_attr(inst): inst for inst in instances}
+        await queryset._afetch_all()
+        all_related_objects = queryset._result_cache
+        for rel_obj in all_related_objects:
+            if not prefetcher.field.is_cached(rel_obj):
+                instance = instances_dict[rel_obj_attr(rel_obj)]
+                prefetcher.field.set_cached_value(rel_obj, instance)
+        single = False
+        cache_name = prefetcher.field.remote_field.cache_name
+        is_descriptor = False
     else:
         raise NotImplementedError
 
@@ -3476,6 +3500,7 @@ async def _aprefetch_one_level_native(instances, prefetcher, lookup, level, asyn
         else:
             msg = "to_attr={} conflicts with a field on the {} model."
             raise ValueError(msg.format(to_attr, model.__name__))
+    leaf = len(lookup.prefetch_through.split(LOOKUP_SEP)) - 1 == level
 
     rel_obj_cache = {}
     for rel_obj in all_related_objects:
@@ -3485,13 +3510,26 @@ async def _aprefetch_one_level_native(instances, prefetcher, lookup, level, asyn
     for obj in instances:
         instance_attr_val = instance_attr(obj)
         vals = rel_obj_cache.get(instance_attr_val, [])
-        val = vals[0] if vals else None
-        if as_attr:
-            setattr(obj, to_attr, val)
-        elif is_descriptor:
-            setattr(obj, cache_name, val)
+        if single:
+            val = vals[0] if vals else None
+            if as_attr:
+                setattr(obj, to_attr, val)
+            elif is_descriptor:
+                setattr(obj, cache_name, val)
+            else:
+                obj._state.fields_cache[cache_name] = val
         else:
-            obj._state.fields_cache[cache_name] = val
+            if as_attr:
+                setattr(obj, to_attr, vals)
+            else:
+                manager = getattr(obj, to_attr)
+                if leaf and lookup.queryset is not None:
+                    qs = manager._apply_rel_filters(lookup.queryset._chain())
+                else:
+                    qs = manager.get_queryset()
+                qs._result_cache = vals
+                qs._prefetch_done = True
+                obj._prefetched_objects_cache[cache_name] = qs
     return all_related_objects
 
 
