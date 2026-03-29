@@ -757,6 +757,7 @@ class AsyncPostgreSQLConnection:
             select,
             db,
             queryset._fetch_mode,
+            async_connection=self,
         )
         known_related_objects = [
             (
@@ -782,6 +783,7 @@ class AsyncPostgreSQLConnection:
                 init_list,
                 row[model_fields_start:model_fields_end],
                 fetch_mode=queryset._fetch_mode,
+                async_connection=self,
             )
             if queryset._fetch_mode.track_peers:
                 peers.append(weak_ref(obj))

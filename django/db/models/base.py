@@ -622,7 +622,7 @@ class Model(AltersData, metaclass=ModelBase):
         post_init.send(sender=cls, instance=self)
 
     @classmethod
-    def from_db(cls, db, field_names, values, *, fetch_mode=None):
+    def from_db(cls, db, field_names, values, *, fetch_mode=None, async_connection=None):
         if len(values) != len(cls._meta.concrete_fields):
             values_iter = iter(values)
             values = [
@@ -634,6 +634,8 @@ class Model(AltersData, metaclass=ModelBase):
         new._state.db = db
         if fetch_mode is not None:
             new._state.fetch_mode = fetch_mode
+        if async_connection is not None:
+            new._state.async_connection = async_connection
         return new
 
     def __repr__(self):
@@ -816,6 +818,86 @@ class Model(AltersData, metaclass=ModelBase):
         self._state.db = db_instance._state.db
 
     async def arefresh_from_db(self, using=None, fields=None, from_queryset=None):
+        async_connection = getattr(self._state, "async_connection", None)
+        if from_queryset is not None:
+            async_connection = getattr(from_queryset, "_async_connection", async_connection)
+        if async_connection is not None:
+            if using is not None and async_connection.alias != using:
+                raise ValueError(
+                    "The native async connection uses database alias %r but "
+                    "arefresh_from_db() targets %r."
+                    % (async_connection.alias, using)
+                )
+            if fields is None:
+                self._prefetched_objects_cache = {}
+            else:
+                prefetched_objects_cache = getattr(self, "_prefetched_objects_cache", ())
+                fields = set(fields)
+                for field in fields.copy():
+                    if field in prefetched_objects_cache:
+                        del prefetched_objects_cache[field]
+                        fields.remove(field)
+                if not fields:
+                    return
+                if any(LOOKUP_SEP in f for f in fields):
+                    raise ValueError(
+                        'Found "%s" in fields argument. Relations and transforms '
+                        "are not allowed in fields." % LOOKUP_SEP
+                    )
+
+            if from_queryset is None:
+                hints = {"instance": self}
+                from_queryset = self.__class__._base_manager.db_manager(
+                    using, hints=hints
+                ).using_async_connection(async_connection)
+            elif getattr(from_queryset, "_async_connection", None) is None:
+                from_queryset = from_queryset.using_async_connection(async_connection)
+            elif using is not None:
+                from_queryset = from_queryset.using(using)
+
+            db_instance_qs = from_queryset.filter(pk=self.pk)
+            deferred_fields = self.get_deferred_fields()
+            if fields is not None:
+                db_instance_qs = db_instance_qs.only(*fields)
+            elif deferred_fields:
+                db_instance_qs = db_instance_qs.only(
+                    *{
+                        f.attname
+                        for f in self._meta.concrete_fields
+                        if f.attname not in deferred_fields
+                    }
+                )
+
+            db_instance = await db_instance_qs.aget()
+            non_loaded_fields = db_instance.get_deferred_fields()
+            for field in self._meta.fields:
+                if field.attname in non_loaded_fields:
+                    continue
+                if field.concrete:
+                    setattr(self, field.attname, getattr(db_instance, field.attname))
+                if field.is_relation:
+                    if field.is_cached(db_instance):
+                        field.set_cached_value(self, field.get_cached_value(db_instance))
+                    elif field.is_cached(self):
+                        field.delete_cached_value(self)
+
+            for rel in self._meta.related_objects:
+                if (fields is None or rel.name in fields) and rel.is_cached(self):
+                    rel.delete_cached_value(self)
+
+            for field in self._meta.private_fields:
+                if (
+                    (fields is None or field.name in fields)
+                    and field.is_relation
+                    and field.is_cached(self)
+                ):
+                    field.delete_cached_value(self)
+
+            self._state.db = db_instance._state.db
+            self._state.async_connection = getattr(
+                db_instance._state, "async_connection", async_connection
+            )
+            return
         return await sync_to_async(self.refresh_from_db)(
             using=using, fields=fields, from_queryset=from_queryset
         )
@@ -918,6 +1000,8 @@ class Model(AltersData, metaclass=ModelBase):
         update_fields=None,
         async_connection=None,
     ):
+        if async_connection is None:
+            async_connection = getattr(self._state, "async_connection", None)
         if async_connection is not None:
             return await self._asave_native(
                 force_insert=force_insert,
@@ -1026,6 +1110,7 @@ class Model(AltersData, metaclass=ModelBase):
 
         self._state.db = using
         self._state.adding = False
+        self._state.async_connection = async_connection
 
         if not meta.auto_created:
             post_save.send(
