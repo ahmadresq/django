@@ -582,3 +582,84 @@ class PostgreSQLAsyncSupportTests(TransactionTestCase):
 
         self.assertEqual(rows, 2)
         self.assertEqual(values, ["delta", "gamma"])
+
+    async def test_native_async_queryset_ain_bulk_uses_native_connection(self):
+        async with await connection.new_async_connection() as async_connection:
+            queryset = CharFieldModel.objects.all().using_async_connection(
+                async_connection
+            )
+            created = await queryset.abulk_create(
+                [
+                    CharFieldModel(field="alpha"),
+                    CharFieldModel(field="beta"),
+                ]
+            )
+
+            with unittest.mock.patch(
+                "django.db.models.query.sync_to_async",
+                side_effect=AssertionError("sync_to_async bridge should not be used"),
+            ):
+                result = await queryset.ain_bulk([created[1].pk, created[0].pk])
+
+        self.assertEqual(list(result), [created[0].pk, created[1].pk])
+        self.assertEqual(result[created[0].pk].field, "alpha")
+        self.assertEqual(result[created[1].pk].field, "beta")
+
+    async def test_native_async_queryset_ain_bulk_values_shapes_use_native_connection(
+        self,
+    ):
+        async with await connection.new_async_connection() as async_connection:
+            queryset = CharFieldModel.objects.all().using_async_connection(
+                async_connection
+            )
+            created = await queryset.abulk_create(
+                [
+                    CharFieldModel(field="alpha"),
+                    CharFieldModel(field="beta"),
+                ]
+            )
+
+            with unittest.mock.patch(
+                "django.db.models.query.sync_to_async",
+                side_effect=AssertionError("sync_to_async bridge should not be used"),
+            ):
+                values_result = await queryset.values("field").ain_bulk(
+                    [created[0].pk, created[1].pk]
+                )
+                values_list_result = await queryset.values_list("field").ain_bulk(
+                    [created[0].pk, created[1].pk]
+                )
+                named_result = await queryset.values_list("field", named=True).ain_bulk(
+                    [created[0].pk, created[1].pk]
+                )
+                flat_result = await queryset.values_list("field", flat=True).ain_bulk(
+                    [created[0].pk, created[1].pk]
+                )
+
+        self.assertEqual(
+            values_result,
+            {
+                created[0].pk: {"field": "alpha"},
+                created[1].pk: {"field": "beta"},
+            },
+        )
+        self.assertEqual(
+            values_list_result,
+            {
+                created[0].pk: ("alpha",),
+                created[1].pk: ("beta",),
+            },
+        )
+        self.assertEqual(named_result[created[0].pk]._fields, ("pk", "field"))
+        self.assertEqual(named_result[created[0].pk].pk, created[0].pk)
+        self.assertEqual(named_result[created[0].pk].field, "alpha")
+        self.assertEqual(named_result[created[1].pk]._fields, ("pk", "field"))
+        self.assertEqual(named_result[created[1].pk].pk, created[1].pk)
+        self.assertEqual(named_result[created[1].pk].field, "beta")
+        self.assertEqual(
+            flat_result,
+            {
+                created[0].pk: "alpha",
+                created[1].pk: "beta",
+            },
+        )
