@@ -830,3 +830,173 @@ class PostgreSQLAsyncSupportTests(TransactionTestCase):
                 await scene.arefresh_from_db()
 
         self.assertEqual(scene.setting, "Swamp")
+
+    async def test_native_async_reverse_related_manager_acreate_uses_native_connection(
+        self,
+    ):
+        async with await connection.new_async_connection() as async_connection:
+            scene = await Scene.objects.all().using_async_connection(async_connection).acreate(
+                scene="Bridge",
+                setting="Bridge",
+            )
+            character = await Character.objects.all().using_async_connection(
+                async_connection
+            ).acreate(name="Robin")
+
+            with (
+                unittest.mock.patch(
+                    "django.db.models.fields.related_descriptors.sync_to_async",
+                    side_effect=AssertionError(
+                        "sync_to_async bridge should not be used"
+                    ),
+                ),
+                unittest.mock.patch(
+                    "django.db.models.query.sync_to_async",
+                    side_effect=AssertionError(
+                        "sync_to_async bridge should not be used"
+                    ),
+                ),
+            ):
+                created = await scene.line_set.acreate(
+                    character=character,
+                    dialogue="Brave Sir Robin.",
+                )
+                count = await scene.line_set.acount()
+
+        self.assertEqual(created.scene_id, scene.pk)
+        self.assertEqual(created.dialogue, "Brave Sir Robin.")
+        self.assertEqual(count, 1)
+
+    async def test_native_async_reverse_related_manager_aadd_uses_native_connection(
+        self,
+    ):
+        async with await connection.new_async_connection() as async_connection:
+            scene_queryset = Scene.objects.all().using_async_connection(async_connection)
+            character_queryset = Character.objects.all().using_async_connection(
+                async_connection
+            )
+            line_queryset = Line.objects.all().using_async_connection(async_connection)
+            source_scene = await scene_queryset.acreate(
+                scene="Source",
+                setting="Forest",
+            )
+            target_scene = await scene_queryset.acreate(
+                scene="Target",
+                setting="Castle",
+            )
+            character = await character_queryset.acreate(name="Lancelot")
+            line = await line_queryset.acreate(
+                scene=source_scene,
+                character=character,
+                dialogue="Charge!",
+            )
+
+            with (
+                unittest.mock.patch(
+                    "django.db.models.fields.related_descriptors.sync_to_async",
+                    side_effect=AssertionError(
+                        "sync_to_async bridge should not be used"
+                    ),
+                ),
+                unittest.mock.patch(
+                    "django.db.models.base.sync_to_async",
+                    side_effect=AssertionError(
+                        "sync_to_async bridge should not be used"
+                    ),
+                ),
+            ):
+                await target_scene.line_set.aadd(line)
+                await line.arefresh_from_db()
+
+        self.assertEqual(line.scene_id, target_scene.pk)
+
+    async def test_native_async_reverse_related_manager_aget_or_create_uses_native_connection(
+        self,
+    ):
+        async with await connection.new_async_connection() as async_connection:
+            scene = await Scene.objects.all().using_async_connection(async_connection).acreate(
+                scene="Hill",
+                setting="Hill",
+            )
+            character = await Character.objects.all().using_async_connection(
+                async_connection
+            ).acreate(name="Galahad")
+
+            with (
+                unittest.mock.patch(
+                    "django.db.models.fields.related_descriptors.sync_to_async",
+                    side_effect=AssertionError(
+                        "sync_to_async bridge should not be used"
+                    ),
+                ),
+                unittest.mock.patch(
+                    "django.db.models.query.sync_to_async",
+                    side_effect=AssertionError(
+                        "sync_to_async bridge should not be used"
+                    ),
+                ),
+            ):
+                created_obj, created = await scene.line_set.aget_or_create(
+                    dialogue="Let me have just a little bit of peril?",
+                    defaults={"character": character},
+                )
+                fetched_obj, fetched = await scene.line_set.aget_or_create(
+                    dialogue="Let me have just a little bit of peril?",
+                    defaults={"character": character},
+                )
+
+        self.assertIs(created, True)
+        self.assertIs(fetched, False)
+        self.assertEqual(created_obj.pk, fetched_obj.pk)
+        self.assertEqual(created_obj.scene_id, scene.pk)
+
+    async def test_native_async_reverse_related_manager_aupdate_or_create_uses_native_connection(
+        self,
+    ):
+        async with await connection.new_async_connection() as async_connection:
+            scene = await Scene.objects.all().using_async_connection(async_connection).acreate(
+                scene="Castle",
+                setting="Castle",
+            )
+            character_queryset = Character.objects.all().using_async_connection(
+                async_connection
+            )
+            first_character = await character_queryset.acreate(name="Arthur")
+            second_character = await character_queryset.acreate(name="Bedevere")
+            existing = await scene.line_set.acreate(
+                character=first_character,
+                dialogue="Old dialogue",
+            )
+
+            with (
+                unittest.mock.patch(
+                    "django.db.models.fields.related_descriptors.sync_to_async",
+                    side_effect=AssertionError(
+                        "sync_to_async bridge should not be used"
+                    ),
+                ),
+                unittest.mock.patch(
+                    "django.db.models.query.sync_to_async",
+                    side_effect=AssertionError(
+                        "sync_to_async bridge should not be used"
+                    ),
+                ),
+            ):
+                updated_obj, updated_created = await scene.line_set.aupdate_or_create(
+                    pk=existing.pk,
+                    defaults={
+                        "character": second_character,
+                        "dialogue": "New dialogue",
+                    },
+                )
+                created_obj, created = await scene.line_set.aupdate_or_create(
+                    dialogue="Fresh dialogue",
+                    defaults={"character": first_character},
+                )
+
+        self.assertIs(updated_created, False)
+        self.assertEqual(updated_obj.pk, existing.pk)
+        self.assertEqual(updated_obj.dialogue, "New dialogue")
+        self.assertEqual(updated_obj.character_id, second_character.pk)
+        self.assertIs(created, True)
+        self.assertEqual(created_obj.scene_id, scene.pk)

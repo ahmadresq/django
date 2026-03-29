@@ -755,6 +755,20 @@ def create_reverse_many_to_one_manager(superclass, rel):
                         f'"{field.attname}" before this relationship can be used.'
                     )
 
+        def _get_instance_async_connection(self, db):
+            async_connection = getattr(self.instance._state, "async_connection", None)
+            if async_connection is None or async_connection.alias != db:
+                return None
+            return async_connection
+
+        def _get_native_async_queryset(self, db):
+            async_connection = self._get_instance_async_connection(db)
+            if async_connection is None:
+                return None, None
+            queryset = super(RelatedManager, self.db_manager(db)).get_queryset()
+            queryset = queryset.using_async_connection(async_connection)
+            return async_connection, queryset
+
         def _apply_rel_filters(self, queryset):
             """
             Filter the queryset for the instance this manager is bound to.
@@ -896,6 +910,45 @@ def create_reverse_many_to_one_manager(superclass, rel):
         add.alters_data = True
 
         async def aadd(self, *objs, bulk=True):
+            self._check_fk_val()
+            self._remove_prefetched_objects()
+            db = router.db_for_write(self.model, instance=self.instance)
+            async_connection, queryset = self._get_native_async_queryset(db)
+            if async_connection is not None:
+                def check_and_update_obj(obj):
+                    if not isinstance(obj, self.model):
+                        raise TypeError(
+                            "'%s' instance expected, got %r"
+                            % (
+                                self.model._meta.object_name,
+                                obj,
+                            )
+                        )
+                    setattr(obj, self.field.name, self.instance)
+
+                if bulk:
+                    pks = []
+                    for obj in objs:
+                        check_and_update_obj(obj)
+                        if obj._state.adding or obj._state.db != db:
+                            raise ValueError(
+                                "%r instance isn't saved. Use bulk=False or save "
+                                "the object first." % obj
+                            )
+                        pks.append(obj.pk)
+                    await queryset.filter(pk__in=pks).aupdate(
+                        **{
+                            self.field.name: self.instance,
+                        }
+                    )
+                    for obj in objs:
+                        obj._state.async_connection = async_connection
+                    return
+                async with async_connection.atomic(savepoint=False):
+                    for obj in objs:
+                        check_and_update_obj(obj)
+                        await obj.asave(async_connection=async_connection)
+                return
             return await sync_to_async(self.add)(*objs, bulk=bulk)
 
         aadd.alters_data = True
@@ -910,6 +963,20 @@ def create_reverse_many_to_one_manager(superclass, rel):
         create.alters_data = True
 
         async def acreate(self, **kwargs):
+            self._check_fk_val()
+            self._remove_prefetched_objects()
+            kwargs[self.field.name] = self.instance
+            db = router.db_for_write(self.model, instance=self.instance)
+            async_connection = self._get_instance_async_connection(db)
+            if async_connection is not None:
+                obj = self.model(**kwargs)
+                await obj.asave(
+                    force_insert=True,
+                    using=db,
+                    async_connection=async_connection,
+                )
+                obj._state.fetch_mode = self.instance._state.fetch_mode
+                return obj
             return await sync_to_async(self.create)(**kwargs)
 
         acreate.alters_data = True
@@ -923,6 +990,12 @@ def create_reverse_many_to_one_manager(superclass, rel):
         get_or_create.alters_data = True
 
         async def aget_or_create(self, **kwargs):
+            self._check_fk_val()
+            kwargs[self.field.name] = self.instance
+            db = router.db_for_write(self.model, instance=self.instance)
+            async_connection, queryset = self._get_native_async_queryset(db)
+            if async_connection is not None:
+                return await queryset.aget_or_create(**kwargs)
             return await sync_to_async(self.get_or_create)(**kwargs)
 
         aget_or_create.alters_data = True
@@ -936,6 +1009,12 @@ def create_reverse_many_to_one_manager(superclass, rel):
         update_or_create.alters_data = True
 
         async def aupdate_or_create(self, **kwargs):
+            self._check_fk_val()
+            kwargs[self.field.name] = self.instance
+            db = router.db_for_write(self.model, instance=self.instance)
+            async_connection, queryset = self._get_native_async_queryset(db)
+            if async_connection is not None:
+                return await queryset.aupdate_or_create(**kwargs)
             return await sync_to_async(self.update_or_create)(**kwargs)
 
         aupdate_or_create.alters_data = True
