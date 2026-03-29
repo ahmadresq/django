@@ -3401,8 +3401,22 @@ async def _aprefetch_one_level_native(instances, prefetcher, lookup, level, asyn
         and hasattr(prefetcher, "instance")
         and not hasattr(prefetcher, "through")
     )
+    many_to_many = (
+        hasattr(prefetcher, "through")
+        and hasattr(prefetcher, "source_field_name")
+        and hasattr(prefetcher, "target_field_name")
+    )
     current_querysets = lookup.get_current_querysets(level)
-    if current_querysets:
+    if many_to_many:
+        (
+            queryset,
+            rel_obj_attr,
+            instance_attr,
+            single,
+            cache_name,
+            is_descriptor,
+        ) = prefetcher.get_prefetch_querysets(instances, current_querysets)
+    elif current_querysets:
         if len(current_querysets) != 1:
             raise ValueError(
                 "querysets argument of get_prefetch_querysets() should have a "
@@ -3480,6 +3494,10 @@ async def _aprefetch_one_level_native(instances, prefetcher, lookup, level, asyn
         single = False
         cache_name = prefetcher.field.remote_field.cache_name
         is_descriptor = False
+    elif many_to_many:
+        queryset = _bind_async_prefetch_queryset(queryset, async_connection)
+        await queryset._afetch_all()
+        all_related_objects = queryset._result_cache
     else:
         raise NotImplementedError
 

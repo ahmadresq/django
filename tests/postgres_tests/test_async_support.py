@@ -1189,3 +1189,97 @@ class PostgreSQLAsyncSupportTests(TransactionTestCase):
         self.assertEqual(updated.name, "Dennis")
         self.assertIs(updated_created, True)
         self.assertEqual(related_names, ["Dennis", "Patsy", "Tim"])
+
+    async def test_native_async_queryset_prefetch_related_many_to_many_uses_native_connection(
+        self,
+    ):
+        async with await connection.new_async_connection() as async_connection:
+            scene_queryset = Scene.objects.all().using_async_connection(async_connection)
+            character_queryset = Character.objects.all().using_async_connection(
+                async_connection
+            )
+            scene = await scene_queryset.acreate(scene="Shrubbery", setting="Forest")
+            characters = await character_queryset.abulk_create(
+                [
+                    Character(name="Knight"),
+                    Character(name="Roger"),
+                ]
+            )
+            await scene.characters.aadd(*characters)
+
+            with unittest.mock.patch(
+                "django.db.models.query.sync_to_async",
+                side_effect=AssertionError("sync_to_async bridge should not be used"),
+            ):
+                fetched = await scene_queryset.prefetch_related("characters").aget(
+                    pk=scene.pk
+                )
+
+        cached_queryset = fetched._prefetched_objects_cache["characters"]
+        self.assertEqual(
+            sorted(character.name for character in cached_queryset),
+            ["Knight", "Roger"],
+        )
+
+    async def test_native_async_queryset_prefetch_related_many_to_many_to_attr_uses_native_connection(
+        self,
+    ):
+        async with await connection.new_async_connection() as async_connection:
+            scene_queryset = Scene.objects.all().using_async_connection(async_connection)
+            character_queryset = Character.objects.all().using_async_connection(
+                async_connection
+            )
+            scene = await scene_queryset.acreate(scene="Cave", setting="Cave")
+            characters = await character_queryset.abulk_create(
+                [
+                    Character(name="Black Beast"),
+                    Character(name="Bors"),
+                    Character(name="Tim"),
+                ]
+            )
+            await scene.characters.aadd(*characters)
+
+            with unittest.mock.patch(
+                "django.db.models.query.sync_to_async",
+                side_effect=AssertionError("sync_to_async bridge should not be used"),
+            ):
+                fetched = await scene_queryset.prefetch_related(
+                    Prefetch(
+                        "characters",
+                        queryset=Character.objects.filter(name__startswith="B"),
+                        to_attr="b_characters",
+                    )
+                ).aget(pk=scene.pk)
+
+        self.assertEqual(
+            sorted(character.name for character in fetched.b_characters),
+            ["Black Beast", "Bors"],
+        )
+
+    async def test_native_async_queryset_prefetch_related_reverse_many_to_many_uses_native_connection(
+        self,
+    ):
+        async with await connection.new_async_connection() as async_connection:
+            scene_queryset = Scene.objects.all().using_async_connection(async_connection)
+            character_queryset = Character.objects.all().using_async_connection(
+                async_connection
+            )
+            first_scene = await scene_queryset.acreate(scene="Hill", setting="Hill")
+            second_scene = await scene_queryset.acreate(scene="Moat", setting="Moat")
+            character = await character_queryset.acreate(name="Robin")
+            await first_scene.characters.aadd(character)
+            await second_scene.characters.aadd(character)
+
+            with unittest.mock.patch(
+                "django.db.models.query.sync_to_async",
+                side_effect=AssertionError("sync_to_async bridge should not be used"),
+            ):
+                fetched = await character_queryset.prefetch_related("scenes").aget(
+                    pk=character.pk
+                )
+
+        cached_queryset = fetched._prefetched_objects_cache["scenes"]
+        self.assertEqual(
+            sorted(scene.scene for scene in cached_queryset),
+            ["Hill", "Moat"],
+        )
