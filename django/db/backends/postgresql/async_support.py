@@ -513,6 +513,16 @@ class AsyncPostgreSQLConnection:
             rows = compiler.apply_converters(rows, converters)
         return list(rows)
 
+    async def raw_delete_queryset(self, queryset):
+        from django.db.models import sql
+        from django.db.models.sql.constants import ROW_COUNT
+
+        query = queryset.query.clone()
+        query.__class__ = sql.DeleteQuery
+        compiler = self.get_compiler(query)
+        row_count = await self.execute_compiler(compiler, result_type=ROW_COUNT)
+        return row_count or 0
+
     async def count_queryset(self, queryset):
         from django.core.exceptions import EmptyResultSet
 

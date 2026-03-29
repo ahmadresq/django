@@ -1290,6 +1290,39 @@ def create_forward_many_to_many_manager(superclass, rel, reverse):
                 queryset = super().get_queryset()
                 return self._apply_rel_filters(queryset)
 
+        def _get_instance_async_connection(self, db):
+            async_connection = getattr(self.instance._state, "async_connection", None)
+            if async_connection is None or async_connection.alias != db:
+                return None
+            return async_connection
+
+        def _get_native_async_queryset(self, db):
+            async_connection = self._get_instance_async_connection(db)
+            if async_connection is None:
+                return None, None
+            queryset = self.get_queryset()
+            if getattr(queryset, "_async_connection", None) is None:
+                queryset = queryset.using_async_connection(async_connection)
+            return async_connection, queryset
+
+        def _get_native_async_base_queryset(self, db):
+            async_connection = self._get_instance_async_connection(db)
+            if async_connection is None:
+                return None, None
+            queryset = super(ManyRelatedManager, self.db_manager(db)).get_queryset()
+            if getattr(queryset, "_async_connection", None) is None:
+                queryset = queryset.using_async_connection(async_connection)
+            return async_connection, queryset
+
+        def _get_native_async_through_queryset(self, db):
+            async_connection = self._get_instance_async_connection(db)
+            if async_connection is None:
+                return None, None
+            queryset = self.through._default_manager.using(db).all()
+            if getattr(queryset, "_async_connection", None) is None:
+                queryset = queryset.using_async_connection(async_connection)
+            return async_connection, queryset
+
         def get_prefetch_querysets(self, instances, querysets=None):
             _cloning_disabled = False
             if querysets:
@@ -1420,6 +1453,21 @@ def create_forward_many_to_many_manager(superclass, rel, reverse):
         add.alters_data = True
 
         async def aadd(self, *objs, through_defaults=None):
+            self._remove_prefetched_objects()
+            db = router.db_for_write(self.through, instance=self.instance)
+            async_connection, through_queryset = self._get_native_async_through_queryset(
+                db
+            )
+            if async_connection is not None:
+                await self._aadd_base(
+                    *objs,
+                    through_defaults=through_defaults,
+                    using=db,
+                    raw=False,
+                    async_connection=async_connection,
+                    through_queryset=through_queryset,
+                )
+                return
             return await sync_to_async(self.add)(
                 *objs, through_defaults=through_defaults
             )
@@ -1440,6 +1488,23 @@ def create_forward_many_to_many_manager(superclass, rel, reverse):
         remove.alters_data = True
 
         async def aremove(self, *objs):
+            self._remove_prefetched_objects()
+            db = router.db_for_write(self.through, instance=self.instance)
+            async_connection, through_queryset = self._get_native_async_through_queryset(
+                db
+            )
+            if (
+                async_connection is not None
+                and self.through._meta.auto_created is not False
+            ):
+                await self._aremove_base(
+                    *objs,
+                    using=db,
+                    raw=False,
+                    async_connection=async_connection,
+                    through_queryset=through_queryset,
+                )
+                return
             return await sync_to_async(self.remove)(*objs)
 
         aremove.alters_data = True
@@ -1479,6 +1544,22 @@ def create_forward_many_to_many_manager(superclass, rel, reverse):
         clear.alters_data = True
 
         async def aclear(self):
+            self._remove_prefetched_objects()
+            db = router.db_for_write(self.through, instance=self.instance)
+            async_connection, through_queryset = self._get_native_async_through_queryset(
+                db
+            )
+            if (
+                async_connection is not None
+                and self.through._meta.auto_created is not False
+            ):
+                await self._aclear_base(
+                    using=db,
+                    raw=False,
+                    async_connection=async_connection,
+                    through_queryset=through_queryset,
+                )
+                return
             return await sync_to_async(self.clear)()
 
         aclear.alters_data = True
@@ -1526,6 +1607,61 @@ def create_forward_many_to_many_manager(superclass, rel, reverse):
         set.alters_data = True
 
         async def aset(self, objs, *, clear=False, through_defaults=None):
+            objs = tuple(objs)
+            db = router.db_for_write(self.through, instance=self.instance)
+            async_connection, queryset = self._get_native_async_queryset(db)
+            if (
+                async_connection is not None
+                and self.through._meta.auto_created is not False
+            ):
+                self._remove_prefetched_objects()
+                async with async_connection.atomic(savepoint=False):
+                    if clear:
+                        await self._aclear_base(
+                            using=db,
+                            raw=False,
+                            async_connection=async_connection,
+                        )
+                        await self._aadd_base(
+                            *objs,
+                            through_defaults=through_defaults,
+                            using=db,
+                            raw=False,
+                            async_connection=async_connection,
+                        )
+                    else:
+                        old_ids = {
+                            target_id
+                            async for target_id in queryset.values_list(
+                                self.target_field.target_field.attname,
+                                flat=True,
+                            )
+                        }
+                        new_objs = []
+                        for obj in objs:
+                            fk_val = (
+                                self.target_field.get_foreign_related_value(obj)[0]
+                                if isinstance(obj, self.model)
+                                else self.target_field.get_prep_value(obj)
+                            )
+                            if fk_val in old_ids:
+                                old_ids.remove(fk_val)
+                            else:
+                                new_objs.append(obj)
+                        await self._aremove_base(
+                            *old_ids,
+                            using=db,
+                            raw=False,
+                            async_connection=async_connection,
+                        )
+                        await self._aadd_base(
+                            *new_objs,
+                            through_defaults=through_defaults,
+                            using=db,
+                            raw=False,
+                            async_connection=async_connection,
+                        )
+                return
             return await sync_to_async(self.set)(
                 objs=objs, clear=clear, through_defaults=through_defaults
             )
@@ -1541,6 +1677,13 @@ def create_forward_many_to_many_manager(superclass, rel, reverse):
         create.alters_data = True
 
         async def acreate(self, *, through_defaults=None, **kwargs):
+            db = router.db_for_write(self.instance.__class__, instance=self.instance)
+            async_connection, queryset = self._get_native_async_base_queryset(db)
+            if async_connection is not None:
+                new_obj = await queryset.acreate(**kwargs)
+                new_obj._state.fetch_mode = self.instance._state.fetch_mode
+                await self.aadd(new_obj, through_defaults=through_defaults)
+                return new_obj
             return await sync_to_async(self.create)(
                 through_defaults=through_defaults, **kwargs
             )
@@ -1561,6 +1704,14 @@ def create_forward_many_to_many_manager(superclass, rel, reverse):
         get_or_create.alters_data = True
 
         async def aget_or_create(self, *, through_defaults=None, **kwargs):
+            db = router.db_for_write(self.instance.__class__, instance=self.instance)
+            async_connection, queryset = self._get_native_async_base_queryset(db)
+            if async_connection is not None:
+                obj, created = await queryset.aget_or_create(**kwargs)
+                obj._state.fetch_mode = self.instance._state.fetch_mode
+                if created:
+                    await self.aadd(obj, through_defaults=through_defaults)
+                return obj, created
             return await sync_to_async(self.get_or_create)(
                 through_defaults=through_defaults, **kwargs
             )
@@ -1581,11 +1732,282 @@ def create_forward_many_to_many_manager(superclass, rel, reverse):
         update_or_create.alters_data = True
 
         async def aupdate_or_create(self, *, through_defaults=None, **kwargs):
+            db = router.db_for_write(self.instance.__class__, instance=self.instance)
+            async_connection, queryset = self._get_native_async_base_queryset(db)
+            if async_connection is not None:
+                obj, created = await queryset.aupdate_or_create(**kwargs)
+                obj._state.fetch_mode = self.instance._state.fetch_mode
+                if created:
+                    await self.aadd(obj, through_defaults=through_defaults)
+                return obj, created
             return await sync_to_async(self.update_or_create)(
                 through_defaults=through_defaults, **kwargs
             )
 
         aupdate_or_create.alters_data = True
+
+        async def _aget_missing_target_ids(
+            self,
+            source_field_name,
+            target_field_name,
+            db,
+            target_ids,
+            *,
+            through_queryset=None,
+        ):
+            if not target_ids:
+                return set()
+            if through_queryset is None:
+                _, through_queryset = self._get_native_async_through_queryset(db)
+            existing_ids = {
+                target_id
+                async for target_id in through_queryset.filter(
+                    **{
+                        source_field_name: self.related_val[0],
+                        f"{target_field_name}__in": target_ids,
+                    }
+                ).values_list(target_field_name, flat=True)
+            }
+            return target_ids.difference(existing_ids)
+
+        async def _aadd_items(
+            self,
+            source_field_name,
+            target_field_name,
+            *objs,
+            through_defaults=None,
+            using=None,
+            raw=False,
+            async_connection=None,
+            through_queryset=None,
+        ):
+            if not objs:
+                return
+            through_defaults = dict(resolve_callables(through_defaults or {}))
+            db = using or router.db_for_write(self.through, instance=self.instance)
+            async_connection = async_connection or self._get_instance_async_connection(db)
+            if async_connection is None:
+                raise RuntimeError("Native async many-to-many add requires an async connection.")
+            if through_queryset is None:
+                _, through_queryset = self._get_native_async_through_queryset(db)
+            target_ids = self._get_target_ids(target_field_name, objs)
+            can_ignore_conflicts, must_send_signals, can_fast_add = self._get_add_plan(
+                db, source_field_name
+            )
+            if can_fast_add:
+                await through_queryset.abulk_create(
+                    [
+                        self.through(
+                            **{
+                                f"{source_field_name}_id": self.related_val[0],
+                                f"{target_field_name}_id": target_id,
+                            }
+                        )
+                        for target_id in target_ids
+                    ],
+                    ignore_conflicts=True,
+                )
+                return
+            missing_target_ids = await self._aget_missing_target_ids(
+                source_field_name,
+                target_field_name,
+                db,
+                target_ids,
+                through_queryset=through_queryset,
+            )
+            async with async_connection.atomic(savepoint=False):
+                if must_send_signals:
+                    signals.m2m_changed.send(
+                        sender=self.through,
+                        action="pre_add",
+                        instance=self.instance,
+                        reverse=self.reverse,
+                        model=self.model,
+                        pk_set=missing_target_ids,
+                        using=db,
+                        raw=raw,
+                    )
+                await through_queryset.abulk_create(
+                    [
+                        self.through(
+                            **through_defaults,
+                            **{
+                                f"{source_field_name}_id": self.related_val[0],
+                                f"{target_field_name}_id": target_id,
+                            },
+                        )
+                        for target_id in missing_target_ids
+                    ],
+                    ignore_conflicts=can_ignore_conflicts,
+                )
+                if must_send_signals:
+                    signals.m2m_changed.send(
+                        sender=self.through,
+                        action="post_add",
+                        instance=self.instance,
+                        reverse=self.reverse,
+                        model=self.model,
+                        pk_set=missing_target_ids,
+                        using=db,
+                        raw=raw,
+                    )
+
+        async def _aadd_base(
+            self,
+            *objs,
+            through_defaults=None,
+            using=None,
+            raw=False,
+            async_connection=None,
+            through_queryset=None,
+        ):
+            db = using or router.db_for_write(self.through, instance=self.instance)
+            async_connection = async_connection or self._get_instance_async_connection(db)
+            if async_connection is None:
+                raise RuntimeError("Native async many-to-many add requires an async connection.")
+            if through_queryset is None:
+                _, through_queryset = self._get_native_async_through_queryset(db)
+            async with async_connection.atomic(savepoint=False):
+                await self._aadd_items(
+                    self.source_field_name,
+                    self.target_field_name,
+                    *objs,
+                    through_defaults=through_defaults,
+                    using=db,
+                    raw=raw,
+                    async_connection=async_connection,
+                    through_queryset=through_queryset,
+                )
+                if self.symmetrical:
+                    await self._aadd_items(
+                        self.target_field_name,
+                        self.source_field_name,
+                        *objs,
+                        through_defaults=through_defaults,
+                        using=db,
+                        raw=raw,
+                        async_connection=async_connection,
+                        through_queryset=through_queryset,
+                    )
+
+        async def _aremove_items(
+            self,
+            source_field_name,
+            target_field_name,
+            *objs,
+            using=None,
+            raw=False,
+            async_connection=None,
+            through_queryset=None,
+        ):
+            if not objs:
+                return
+            old_ids = set()
+            for obj in objs:
+                if isinstance(obj, self.model):
+                    old_ids.add(self.target_field.get_foreign_related_value(obj)[0])
+                else:
+                    old_ids.add(obj)
+            db = using or router.db_for_write(self.through, instance=self.instance)
+            async_connection = async_connection or self._get_instance_async_connection(db)
+            if async_connection is None:
+                raise RuntimeError(
+                    "Native async many-to-many remove requires an async connection."
+                )
+            if through_queryset is None:
+                _, through_queryset = self._get_native_async_through_queryset(db)
+            async with async_connection.atomic(savepoint=False):
+                signals.m2m_changed.send(
+                    sender=self.through,
+                    action="pre_remove",
+                    instance=self.instance,
+                    reverse=self.reverse,
+                    model=self.model,
+                    pk_set=old_ids,
+                    using=db,
+                    raw=raw,
+                )
+                target_model_qs = super().get_queryset()
+                if target_model_qs._has_filters():
+                    old_vals = target_model_qs.using(db).filter(
+                        **{f"{self.target_field.target_field.attname}__in": old_ids}
+                    )
+                else:
+                    old_vals = old_ids
+                filters = self._build_remove_filters(old_vals)
+                await async_connection.raw_delete_queryset(
+                    through_queryset.filter(filters)
+                )
+                signals.m2m_changed.send(
+                    sender=self.through,
+                    action="post_remove",
+                    instance=self.instance,
+                    reverse=self.reverse,
+                    model=self.model,
+                    pk_set=old_ids,
+                    using=db,
+                    raw=raw,
+                )
+
+        async def _aremove_base(
+            self,
+            *objs,
+            using=None,
+            raw=False,
+            async_connection=None,
+            through_queryset=None,
+        ):
+            db = using or router.db_for_write(self.through, instance=self.instance)
+            await self._aremove_items(
+                self.source_field_name,
+                self.target_field_name,
+                *objs,
+                using=db,
+                raw=raw,
+                async_connection=async_connection,
+                through_queryset=through_queryset,
+            )
+
+        async def _aclear_base(
+            self,
+            using=None,
+            raw=False,
+            async_connection=None,
+            through_queryset=None,
+        ):
+            db = using or router.db_for_write(self.through, instance=self.instance)
+            async_connection = async_connection or self._get_instance_async_connection(db)
+            if async_connection is None:
+                raise RuntimeError(
+                    "Native async many-to-many clear requires an async connection."
+                )
+            if through_queryset is None:
+                _, through_queryset = self._get_native_async_through_queryset(db)
+            async with async_connection.atomic(savepoint=False):
+                signals.m2m_changed.send(
+                    sender=self.through,
+                    action="pre_clear",
+                    instance=self.instance,
+                    reverse=self.reverse,
+                    model=self.model,
+                    pk_set=None,
+                    using=db,
+                    raw=raw,
+                )
+                filters = self._build_remove_filters(super().get_queryset().using(db))
+                await async_connection.raw_delete_queryset(
+                    through_queryset.filter(filters)
+                )
+                signals.m2m_changed.send(
+                    sender=self.through,
+                    action="post_clear",
+                    instance=self.instance,
+                    reverse=self.reverse,
+                    model=self.model,
+                    pk_set=None,
+                    using=db,
+                    raw=raw,
+                )
 
         def _get_target_ids(self, target_field_name, objs):
             """

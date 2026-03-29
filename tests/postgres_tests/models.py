@@ -115,6 +115,7 @@ class BigAutoFieldModel(models.Model):
 class Scene(models.Model):
     scene = models.TextField()
     setting = models.CharField(max_length=255)
+    characters = models.ManyToManyField("Character", related_name="scenes", blank=True)
 
 
 class Character(models.Model):

@@ -1064,3 +1064,128 @@ class PostgreSQLAsyncSupportTests(TransactionTestCase):
                 ).aget(pk=scene.pk)
 
         self.assertEqual([line.dialogue for line in fetched.filtered_lines], ["Beta"])
+
+    async def test_native_async_many_to_many_manager_reads_use_instance_connection(
+        self,
+    ):
+        async with await connection.new_async_connection() as async_connection:
+            scene_queryset = Scene.objects.all().using_async_connection(async_connection)
+            character_queryset = Character.objects.all().using_async_connection(
+                async_connection
+            )
+            scene = await scene_queryset.acreate(scene="Bridge", setting="Bridge")
+            characters = await character_queryset.abulk_create(
+                [
+                    Character(name="Arthur"),
+                    Character(name="Lancelot"),
+                ]
+            )
+            await scene.characters.aadd(*characters)
+
+            with (
+                unittest.mock.patch(
+                    "django.db.models.fields.related_descriptors.sync_to_async",
+                    side_effect=AssertionError(
+                        "sync_to_async bridge should not be used"
+                    ),
+                ),
+                unittest.mock.patch(
+                    "django.db.models.query.sync_to_async",
+                    side_effect=AssertionError(
+                        "sync_to_async bridge should not be used"
+                    ),
+                ),
+            ):
+                count = await scene.characters.acount()
+                names = [
+                    character.name
+                    async for character in scene.characters.order_by("name")
+                ]
+
+        self.assertEqual(count, 2)
+        self.assertEqual(names, ["Arthur", "Lancelot"])
+
+    async def test_native_async_many_to_many_manager_write_helpers_use_native_connection(
+        self,
+    ):
+        async with await connection.new_async_connection() as async_connection:
+            scene_queryset = Scene.objects.all().using_async_connection(async_connection)
+            character_queryset = Character.objects.all().using_async_connection(
+                async_connection
+            )
+            scene = await scene_queryset.acreate(scene="Castle", setting="Castle")
+            keep, remove, add_later = await character_queryset.abulk_create(
+                [
+                    Character(name="Keep"),
+                    Character(name="Remove"),
+                    Character(name="Add later"),
+                ]
+            )
+
+            with (
+                unittest.mock.patch(
+                    "django.db.models.fields.related_descriptors.sync_to_async",
+                    side_effect=AssertionError(
+                        "sync_to_async bridge should not be used"
+                    ),
+                ),
+                unittest.mock.patch(
+                    "django.db.models.query.sync_to_async",
+                    side_effect=AssertionError(
+                        "sync_to_async bridge should not be used"
+                    ),
+                ),
+            ):
+                await scene.characters.aadd(keep, remove)
+                await scene.characters.aremove(remove)
+                await scene.characters.aset([keep, add_later])
+                after_set = [
+                    character.name
+                    async for character in scene.characters.order_by("name")
+                ]
+                await scene.characters.aclear()
+                final_count = await scene.characters.acount()
+
+        self.assertEqual(after_set, ["Add later", "Keep"])
+        self.assertEqual(final_count, 0)
+
+    async def test_native_async_many_to_many_manager_object_creation_uses_native_connection(
+        self,
+    ):
+        async with await connection.new_async_connection() as async_connection:
+            scene_queryset = Scene.objects.all().using_async_connection(async_connection)
+            scene = await scene_queryset.acreate(scene="Grail", setting="Cave")
+
+            with (
+                unittest.mock.patch(
+                    "django.db.models.fields.related_descriptors.sync_to_async",
+                    side_effect=AssertionError(
+                        "sync_to_async bridge should not be used"
+                    ),
+                ),
+                unittest.mock.patch(
+                    "django.db.models.query.sync_to_async",
+                    side_effect=AssertionError(
+                        "sync_to_async bridge should not be used"
+                    ),
+                ),
+            ):
+                created = await scene.characters.acreate(name="Tim")
+                fetched, created_flag = await scene.characters.aget_or_create(
+                    name="Patsy"
+                )
+                updated, updated_created = await scene.characters.aupdate_or_create(
+                    name="Dennis",
+                    defaults={},
+                )
+                related_names = [
+                    character.name
+                    async for character in scene.characters.order_by("name")
+                ]
+
+        self.assertEqual(created.name, "Tim")
+        self.assertEqual(fetched.name, "Patsy")
+        self.assertIs(created_flag, True)
+        self.assertEqual(updated.name, "Dennis")
+        self.assertIs(updated_created, True)
+        self.assertEqual(related_names, ["Dennis", "Patsy", "Tim"])
