@@ -742,3 +742,91 @@ class PostgreSQLAsyncSupportTests(TransactionTestCase):
         self.assertEqual(fetched.dialogue, "It is but a scratch.")
         self.assertTrue(hasattr(fetched, "prefetched_scene"))
         self.assertIsNone(fetched.prefetched_scene)
+
+    async def test_native_async_instance_asave_uses_state_connection(self):
+        async with await connection.new_async_connection() as async_connection:
+            queryset = CharFieldModel.objects.all().using_async_connection(
+                async_connection
+            )
+            obj = await queryset.acreate(field="alpha")
+
+            with unittest.mock.patch(
+                "django.db.models.base.sync_to_async",
+                side_effect=AssertionError("sync_to_async bridge should not be used"),
+            ):
+                obj.field = "beta"
+                await obj.asave()
+                refreshed = await queryset.aget(pk=obj.pk)
+
+        self.assertEqual(refreshed.field, "beta")
+
+    async def test_native_async_instance_arefresh_from_db_uses_state_connection(self):
+        async with await connection.new_async_connection() as async_connection:
+            queryset = CharFieldModel.objects.all().using_async_connection(
+                async_connection
+            )
+            obj = await queryset.acreate(field="alpha")
+            await async_connection.execute(
+                "UPDATE postgres_tests_charfieldmodel SET field = %s WHERE id = %s",
+                ["gamma", obj.pk],
+            )
+
+            with unittest.mock.patch(
+                "django.db.models.base.sync_to_async",
+                side_effect=AssertionError("sync_to_async bridge should not be used"),
+            ):
+                await obj.arefresh_from_db()
+
+        self.assertEqual(obj.field, "gamma")
+
+    async def test_native_async_related_manager_reads_use_instance_connection(self):
+        async with await connection.new_async_connection() as async_connection:
+            scene_queryset = Scene.objects.all().using_async_connection(async_connection)
+            character_queryset = Character.objects.all().using_async_connection(
+                async_connection
+            )
+            line_queryset = Line.objects.all().using_async_connection(async_connection)
+            scene = await scene_queryset.acreate(scene="Bridge", setting="Bridge")
+            character = await character_queryset.acreate(name="Bedevere")
+            await line_queryset.abulk_create(
+                [
+                    Line(scene=scene, character=character, dialogue="First"),
+                    Line(scene=scene, character=character, dialogue="Second"),
+                ]
+            )
+
+            with unittest.mock.patch(
+                "django.db.models.query.sync_to_async",
+                side_effect=AssertionError("sync_to_async bridge should not be used"),
+            ):
+                count = await scene.line_set.acount()
+                first = await scene.line_set.order_by("dialogue").afirst()
+
+        self.assertEqual(count, 2)
+        self.assertEqual(first.dialogue, "First")
+
+    async def test_native_async_select_related_instances_keep_connection_state(self):
+        async with await connection.new_async_connection() as async_connection:
+            scene_queryset = Scene.objects.all().using_async_connection(async_connection)
+            character_queryset = Character.objects.all().using_async_connection(
+                async_connection
+            )
+            queryset = Line.objects.all().using_async_connection(async_connection)
+            scene = await scene_queryset.acreate(scene="Intro", setting="Castle")
+            character = await character_queryset.acreate(name="Arthur")
+            line = await queryset.acreate(
+                scene=scene,
+                character=character,
+                dialogue="Bring out your dead.",
+            )
+            fetched = await queryset.select_related("scene").aget(pk=line.pk)
+
+            with unittest.mock.patch(
+                "django.db.models.base.sync_to_async",
+                side_effect=AssertionError("sync_to_async bridge should not be used"),
+            ):
+                fetched.scene.setting = "Swamp"
+                await fetched.scene.asave()
+                await scene.arefresh_from_db()
+
+        self.assertEqual(scene.setting, "Swamp")

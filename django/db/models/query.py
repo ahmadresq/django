@@ -1087,6 +1087,7 @@ class QuerySet(AltersData):
                     for obj_with_pk in objs_with_pk:
                         obj_with_pk._state.adding = False
                         obj_with_pk._state.db = self.db
+                        obj_with_pk._state.async_connection = self._async_connection
                 if objs_without_pk:
                     insert_fields = [
                         f for f in fields if not isinstance(f, AutoField)
@@ -1112,6 +1113,7 @@ class QuerySet(AltersData):
                             setattr(obj_without_pk, field.attname, result)
                         obj_without_pk._state.adding = False
                         obj_without_pk._state.db = self.db
+                        obj_without_pk._state.async_connection = self._async_connection
 
             if objs_with_pk and objs_without_pk:
                 async with self._async_connection.atomic(savepoint=False):
@@ -3766,9 +3768,10 @@ class RelatedPopulator:
     model instance.
     """
 
-    def __init__(self, klass_info, select, db, fetch_mode):
+    def __init__(self, klass_info, select, db, fetch_mode, async_connection=None):
         self.db = db
         self.fetch_mode = fetch_mode
+        self.async_connection = async_connection
         # Pre-compute needed attributes. The attributes are:
         #  - model_cls: the possibly deferred model class to instantiate
         #  - either:
@@ -3822,7 +3825,11 @@ class RelatedPopulator:
         # key is enough to determine if the referenced object exists or not.
         self.pk_idx = self.init_list.index(self.model_cls._meta.pk_fields[0].attname)
         self.related_populators = get_related_populators(
-            klass_info, select, self.db, fetch_mode
+            klass_info,
+            select,
+            self.db,
+            fetch_mode,
+            async_connection=async_connection,
         )
         self.local_setter = klass_info["local_setter"]
         self.remote_setter = klass_info["remote_setter"]
@@ -3840,6 +3847,7 @@ class RelatedPopulator:
                 self.init_list,
                 obj_data,
                 fetch_mode=self.fetch_mode,
+                async_connection=self.async_connection,
             )
             for rel_iter in self.related_populators:
                 rel_iter.populate(row, obj)
@@ -3848,10 +3856,18 @@ class RelatedPopulator:
             self.remote_setter(obj, from_obj)
 
 
-def get_related_populators(klass_info, select, db, fetch_mode):
+def get_related_populators(
+    klass_info, select, db, fetch_mode, async_connection=None
+):
     iterators = []
     related_klass_infos = klass_info.get("related_klass_infos", [])
     for rel_klass_info in related_klass_infos:
-        rel_cls = RelatedPopulator(rel_klass_info, select, db, fetch_mode)
+        rel_cls = RelatedPopulator(
+            rel_klass_info,
+            select,
+            db,
+            fetch_mode,
+            async_connection=async_connection,
+        )
         iterators.append(rel_cls)
     return iterators

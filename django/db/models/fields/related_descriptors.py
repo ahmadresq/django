@@ -129,6 +129,17 @@ def _traverse_ancestors(model, starting_instance):
         current_instance = ancestor
 
 
+def _bind_instance_async_connection(queryset, instance):
+    async_connection = getattr(instance._state, "async_connection", None)
+    if async_connection is None:
+        return queryset
+    if queryset._db is not None and queryset._db != async_connection.alias:
+        return queryset
+    if getattr(queryset, "_async_connection", None) is not None:
+        return queryset
+    return queryset.using_async_connection(async_connection)
+
+
 class ForwardManyToOneDescriptor:
     """
     Accessor to the related object on the forward side of a many-to-one or
@@ -167,9 +178,10 @@ class ForwardManyToOneDescriptor:
         return self.field.is_cached(instance)
 
     def get_queryset(self, *, instance):
-        return self.field.remote_field.model._base_manager.db_manager(
+        queryset = self.field.remote_field.model._base_manager.db_manager(
             hints={"instance": instance}
         ).fetch_mode(instance._state.fetch_mode)
+        return _bind_instance_async_connection(queryset, instance)
 
     def get_prefetch_querysets(self, instances, querysets=None):
         _cloning_disabled = False
@@ -467,9 +479,10 @@ class ReverseOneToOneDescriptor:
         return self.related.is_cached(instance)
 
     def get_queryset(self, *, instance):
-        return self.related.related_model._base_manager.db_manager(
+        queryset = self.related.related_model._base_manager.db_manager(
             hints={"instance": instance}
         ).fetch_mode(instance._state.fetch_mode)
+        return _bind_instance_async_connection(queryset, instance)
 
     def get_prefetch_querysets(self, instances, querysets=None):
         _cloning_disabled = False
@@ -757,6 +770,7 @@ def create_reverse_many_to_one_manager(superclass, rel):
                 queryset._fetch_mode = self.instance._state.fetch_mode
                 queryset._defer_next_filter = True
                 queryset = queryset.filter(**self.core_filters)
+            queryset = _bind_instance_async_connection(queryset, self.instance)
             for field in self.field.foreign_related_fields:
                 val = getattr(self.instance, field.attname)
                 if val is None or (val == "" and empty_strings_as_null):
@@ -1168,7 +1182,8 @@ def create_forward_many_to_many_manager(superclass, rel, reverse):
                     queryset = queryset.using(self._db)
                 queryset._fetch_mode = self.instance._state.fetch_mode
                 queryset._defer_next_filter = True
-                return queryset._next_is_sticky().filter(**self.core_filters)
+                queryset = queryset._next_is_sticky().filter(**self.core_filters)
+            return _bind_instance_async_connection(queryset, self.instance)
 
         def get_prefetch_cache(self):
             # Walk up the ancestor-chain (if cached) to try and find a prefetch
