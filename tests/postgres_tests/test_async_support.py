@@ -1283,3 +1283,111 @@ class PostgreSQLAsyncSupportTests(TransactionTestCase):
             sorted(scene.scene for scene in cached_queryset),
             ["Hill", "Moat"],
         )
+
+    async def test_native_async_queryset_prefetch_related_multi_hop_reverse_fk_then_fk_uses_native_connection(
+        self,
+    ):
+        async with await connection.new_async_connection() as async_connection:
+            scene_queryset = Scene.objects.all().using_async_connection(async_connection)
+            character_queryset = Character.objects.all().using_async_connection(
+                async_connection
+            )
+            line_queryset = Line.objects.all().using_async_connection(async_connection)
+            scene = await scene_queryset.acreate(scene="Bridge", setting="Bridge")
+            first_character = await character_queryset.acreate(name="Arthur")
+            second_character = await character_queryset.acreate(name="Patsy")
+            await line_queryset.abulk_create(
+                [
+                    Line(scene=scene, character=first_character, dialogue="A"),
+                    Line(scene=scene, character=second_character, dialogue="B"),
+                ]
+            )
+
+            with unittest.mock.patch(
+                "django.db.models.query.sync_to_async",
+                side_effect=AssertionError("sync_to_async bridge should not be used"),
+            ):
+                fetched = await scene_queryset.prefetch_related(
+                    "line_set__character"
+                ).aget(pk=scene.pk)
+
+        cached_lines = fetched._prefetched_objects_cache["line_set"]
+        self.assertEqual(
+            sorted(line.character.name for line in cached_lines),
+            ["Arthur", "Patsy"],
+        )
+
+    async def test_native_async_queryset_prefetch_related_multi_hop_many_to_many_uses_native_connection(
+        self,
+    ):
+        async with await connection.new_async_connection() as async_connection:
+            scene_queryset = Scene.objects.all().using_async_connection(async_connection)
+            character_queryset = Character.objects.all().using_async_connection(
+                async_connection
+            )
+            first_scene = await scene_queryset.acreate(scene="Hill", setting="Hill")
+            second_scene = await scene_queryset.acreate(scene="Moat", setting="Moat")
+            character = await character_queryset.acreate(name="Robin")
+            companion = await character_queryset.acreate(name="Patsy")
+            await first_scene.characters.aadd(character, companion)
+            await second_scene.characters.aadd(character)
+
+            with unittest.mock.patch(
+                "django.db.models.query.sync_to_async",
+                side_effect=AssertionError("sync_to_async bridge should not be used"),
+            ):
+                fetched = await character_queryset.prefetch_related(
+                    "scenes__characters"
+                ).aget(pk=character.pk)
+
+        cached_scenes = fetched._prefetched_objects_cache["scenes"]
+        self.assertEqual(
+            sorted(scene.scene for scene in cached_scenes),
+            ["Hill", "Moat"],
+        )
+        self.assertEqual(
+            sorted(
+                nested_character.name
+                for scene in cached_scenes
+                for nested_character in scene._prefetched_objects_cache["characters"]
+            ),
+            ["Patsy", "Robin", "Robin"],
+        )
+
+    async def test_native_async_queryset_prefetch_related_additional_lookups_use_native_connection(
+        self,
+    ):
+        async with await connection.new_async_connection() as async_connection:
+            scene_queryset = Scene.objects.all().using_async_connection(async_connection)
+            character_queryset = Character.objects.all().using_async_connection(
+                async_connection
+            )
+            line_queryset = Line.objects.all().using_async_connection(async_connection)
+            scene = await scene_queryset.acreate(scene="Castle", setting="Castle")
+            first_character = await character_queryset.acreate(name="Guard")
+            second_character = await character_queryset.acreate(name="Dennis")
+            await line_queryset.abulk_create(
+                [
+                    Line(scene=scene, character=first_character, dialogue="First"),
+                    Line(scene=scene, character=second_character, dialogue="Second"),
+                ]
+            )
+
+            with unittest.mock.patch(
+                "django.db.models.query.sync_to_async",
+                side_effect=AssertionError("sync_to_async bridge should not be used"),
+            ):
+                fetched = await scene_queryset.prefetch_related(
+                    Prefetch(
+                        "line_set",
+                        queryset=Line.objects.order_by("dialogue").prefetch_related(
+                            "character"
+                        ),
+                    )
+                ).aget(pk=scene.pk)
+
+        cached_lines = fetched._prefetched_objects_cache["line_set"]
+        self.assertEqual(
+            [(line.dialogue, line.character.name) for line in cached_lines],
+            [("First", "Guard"), ("Second", "Dennis")],
+        )
