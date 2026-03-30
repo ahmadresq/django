@@ -3506,7 +3506,7 @@ async def _aprefetch_one_level_native(instances, prefetcher, lookup, level, asyn
         for additional_lookup in getattr(queryset, "_prefetch_related_lookups", ())
     ]
     if additional_lookups:
-        raise NotImplementedError
+        queryset._prefetch_related_lookups = ()
 
     to_attr, as_attr = lookup.get_current_to_attr(level)
     if as_attr and instances:
@@ -3548,7 +3548,7 @@ async def _aprefetch_one_level_native(instances, prefetcher, lookup, level, asyn
                 qs._result_cache = vals
                 qs._prefetch_done = True
                 obj._prefetched_objects_cache[cache_name] = qs
-    return all_related_objects
+    return all_related_objects, additional_lookups
 
 
 async def _aprefetch_related_objects_native(
@@ -3559,6 +3559,8 @@ async def _aprefetch_related_objects_native(
 
     all_lookups = normalize_prefetch_lookups(reversed(related_lookups))
     done_queries = {}
+    auto_lookups = set()
+    followed_descriptors = set()
     while all_lookups:
         lookup = all_lookups.pop()
         if lookup.prefetch_to in done_queries:
@@ -3571,48 +3573,92 @@ async def _aprefetch_related_objects_native(
             continue
 
         through_attrs = lookup.prefetch_through.split(LOOKUP_SEP)
-        if len(through_attrs) != 1:
-            raise NotImplementedError
 
         obj_list = model_instances
-        for obj in obj_list:
-            if not hasattr(obj, "_prefetched_objects_cache"):
-                obj._prefetched_objects_cache = {}
+        for level, through_attr in enumerate(through_attrs):
+            if not obj_list:
+                break
 
-        through_attr = through_attrs[0]
-        first_obj = next(iter(obj_list))
-        to_attr = lookup.get_current_to_attr(0)[0]
-        prefetcher, descriptor, attr_found, is_fetched = get_prefetcher(
-            first_obj, through_attr, to_attr
-        )
-        if not attr_found:
-            raise AttributeError(
-                "Cannot find '%s' on %s object, '%s' is an invalid "
-                "parameter to prefetch_related()"
-                % (
-                    through_attr,
-                    first_obj.__class__.__name__,
-                    lookup.prefetch_through,
+            prefetch_to = lookup.get_current_prefetch_to(level)
+            if prefetch_to in done_queries:
+                obj_list = done_queries[prefetch_to]
+                continue
+
+            good_objects = True
+            for obj in obj_list:
+                if not hasattr(obj, "_prefetched_objects_cache"):
+                    try:
+                        obj._prefetched_objects_cache = {}
+                    except (AttributeError, TypeError):
+                        good_objects = False
+                        break
+            if not good_objects:
+                break
+
+            first_obj = next(iter(obj_list))
+            to_attr = lookup.get_current_to_attr(level)[0]
+            prefetcher, descriptor, attr_found, is_fetched = get_prefetcher(
+                first_obj, through_attr, to_attr
+            )
+            if not attr_found:
+                raise AttributeError(
+                    "Cannot find '%s' on %s object, '%s' is an invalid "
+                    "parameter to prefetch_related()"
+                    % (
+                        through_attr,
+                        first_obj.__class__.__name__,
+                        lookup.prefetch_through,
+                    )
                 )
-            )
-        if prefetcher is None:
-            raise ValueError(
-                "'%s' does not resolve to an item that supports "
-                "prefetching - this is an invalid parameter to "
-                "prefetch_related()." % lookup.prefetch_through
-            )
 
-        obj_to_fetch = [obj for obj in obj_list if not is_fetched(obj)]
-        if not obj_to_fetch:
-            continue
+            if level == len(through_attrs) - 1 and prefetcher is None:
+                raise ValueError(
+                    "'%s' does not resolve to an item that supports "
+                    "prefetching - this is an invalid parameter to "
+                    "prefetch_related()." % lookup.prefetch_through
+                )
 
-        done_queries[lookup.prefetch_to] = await _aprefetch_one_level_native(
-            obj_to_fetch,
-            prefetcher,
-            lookup,
-            0,
-            async_connection,
-        )
+            obj_to_fetch = None
+            if prefetcher is not None:
+                obj_to_fetch = [obj for obj in obj_list if not is_fetched(obj)]
+
+            if obj_to_fetch:
+                obj_list, additional_lookups = await _aprefetch_one_level_native(
+                    obj_to_fetch,
+                    prefetcher,
+                    lookup,
+                    level,
+                    async_connection,
+                )
+                if not (
+                    prefetch_to in done_queries
+                    and lookup in auto_lookups
+                    and descriptor in followed_descriptors
+                ):
+                    done_queries[prefetch_to] = obj_list
+                    new_lookups = normalize_prefetch_lookups(
+                        reversed(additional_lookups), prefetch_to
+                    )
+                    auto_lookups.update(new_lookups)
+                    all_lookups.extend(new_lookups)
+                followed_descriptors.add(descriptor)
+            else:
+                new_obj_list = []
+                for obj in obj_list:
+                    if through_attr in getattr(obj, "_prefetched_objects_cache", ()):
+                        new_obj = list(obj._prefetched_objects_cache.get(through_attr))
+                    else:
+                        try:
+                            new_obj = getattr(obj, through_attr)
+                        except exceptions.ObjectDoesNotExist:
+                            continue
+                    if new_obj is None:
+                        continue
+                    if isinstance(new_obj, list):
+                        new_obj_list.extend(new_obj)
+                    else:
+                        new_obj_list.append(new_obj)
+                obj_list = new_obj_list
 
 
 async def aprefetch_related_objects(
